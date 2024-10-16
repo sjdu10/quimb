@@ -1628,6 +1628,7 @@ class TensorNetwork2D(TensorNetworkGen):
         equalize_norms=False,
         optimize="auto-hq",
         compress_opts=None,
+        new_tags=None,
     ):
         """Contract the boundary of this 2D tensor network by explicitly
         computing and inserting explicit local projector tensors, which can
