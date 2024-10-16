@@ -1672,13 +1672,15 @@ class TensorNetwork2D(TensorNetworkGen):
         for i, inext in pairwise(r.sweep):
             # we compute the projectors from an untouched copy
             tn_calc = self.copy()
-
+            i_passed = [x for x in range(i)]
             for j in r.sweep_other:
                 # this handles cyclic boundary conditions
                 jnext = r.get_jnext(j)
                 if jnext is not None:
-                    ltags = (r.site_tag(i, j), r.site_tag(inext, j))
-                    rtags = (r.site_tag(i, jnext), r.site_tag(inext, jnext))
+                    # ltags = (r.site_tag(i, j), r.site_tag(inext, j))
+                    # rtags = (r.site_tag(i, jnext), r.site_tag(inext, jnext))
+                    ltags = tuple([r.site_tag(ip, j) for ip in i_passed])+(r.site_tag(i, j), r.site_tag(inext, j))
+                    rtags = tuple([r.site_tag(ip, jnext) for ip in i_passed])+(r.site_tag(i, jnext), r.site_tag(inext, jnext))
                     #      │         │
                     #    ──O─┐ chi ┌─O──  i+1
                     #      │ └─▷═◁─┘ │
@@ -1688,6 +1690,7 @@ class TensorNetwork2D(TensorNetworkGen):
                     tn_calc.insert_compressor_between_regions(
                         ltags,
                         rtags,
+                        new_tags=new_tags,
                         new_ltags=ltags,
                         new_rtags=rtags,
                         insert_into=self,
