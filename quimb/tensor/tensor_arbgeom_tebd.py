@@ -648,7 +648,7 @@ class TEBDGen:
             return self.energies[-1]
 
         if self.compute_energy_fn is not None:
-            en = self.compute_energy_fn(self)
+            en = self.compute_energy_fn(self._psi)
         else:
             en = self.compute_energy()
 
