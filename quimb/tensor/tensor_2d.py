@@ -4808,8 +4808,20 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
         self._Lx = len(arrays)
         self._Ly = len(arrays[0])
 
-        cyclicx = sum(d > 1 for d in ar.shape(arrays[0][1])) == 5
-        cyclicy = sum(d > 1 for d in ar.shape(arrays[1][0])) == 5
+        cyclicx = (
+            sum(d > 1 for d in ar.shape(arrays[0][1])) == 5
+        ) or (
+            # handle D=1 PBC case
+            (ar.ndim(arrays[0][1]) == 5) and
+            (sum(d == 1 for d in ar.shape(arrays[0][1])) == 4)
+        )
+        cyclicy = (
+            sum(d > 1 for d in ar.shape(arrays[1][0])) == 5
+        ) or (
+            # handle D=1 PBC case
+            (ar.ndim(arrays[1][0]) == 5) and
+            (sum(d == 1 for d in ar.shape(arrays[1][0])) == 4)
+        )
 
         # cache for both creating and retrieving indices
         ix = defaultdict(rand_uuid)
@@ -4993,6 +5005,40 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
         """
         return cls.from_fill_fn(
             lambda shape: ar.do("ones", shape, like=like),
+            Lx,
+            Ly,
+            bond_dim,
+            phys_dim,
+            **peps_opts,
+        )
+
+    @classmethod
+    def zeros(cls, Lx, Ly, bond_dim, phys_dim=2, like="numpy", **peps_opts):
+        """Create a 2D PEPS whose tensors are filled with zeros.
+
+        Parameters
+        ----------
+        Lx : int
+            The number of rows.
+        Ly : int
+            The number of columns.
+        bond_dim : int
+            The bond dimension.
+        physical : int, optional
+            The physical index dimension.
+        peps_opts
+            Supplied to :class:`~quimb.tensor.tensor_2d.PEPS`.
+
+        Returns
+        -------
+        psi : PEPS
+
+        See Also
+        --------
+        PEPS.from_fill_fn
+        """
+        return cls.from_fill_fn(
+            lambda shape: ar.do("zeros", shape, like=like),
             Lx,
             Ly,
             bond_dim,

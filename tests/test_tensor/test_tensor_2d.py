@@ -47,6 +47,18 @@ class TestPEPSConstruct:
         assert f"Lx={Lx}" in psi.__str__()
         assert f"Lx={Lx}" in psi.__repr__()
 
+    def test_cyclic_edge_cases(self):
+        peps = qtn.PEPS.rand(3, 3, bond_dim=1, cyclic=True)
+        assert peps.is_cyclic_x()
+        assert peps.is_cyclic_y()
+        assert peps.num_indices == peps.num_tensors * 3
+
+    def test_zeros(self):
+        peps = qtn.PEPS.zeros(3, 3, cyclic=True, bond_dim=1)
+        assert peps.num_tensors == 9
+        assert peps.num_indices == 27
+        assert_allclose(peps.to_dense(), np.zeros([512, 1]))
+
     def test_flatten(self):
         psi = qtn.PEPS.rand(3, 5, 3, seed=42)
         norm = psi.H & psi
