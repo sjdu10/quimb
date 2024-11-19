@@ -509,6 +509,7 @@ class SimpleUpdate(TEBD2D):
         )
         self.gauge_renorm = gauge_renorm
         self.gauge_smudge = gauge_smudge
+        self._gauge_diffs = []
         self.condition_tensors = condition_tensors
         self.condition_balance_bonds = condition_balance_bonds
         self.gate_opts['long_range_use_swaps'] = long_range_use_swaps
