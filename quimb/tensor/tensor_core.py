@@ -79,6 +79,7 @@ from .fitting import (
     tensor_network_distance,
     tensor_network_fit_als,
     tensor_network_fit_autodiff,
+    tensor_network_fit_tree,
 )
 from .networking import (
     compute_centralities,
@@ -90,9 +91,12 @@ from .networking import (
     gen_all_paths_between_tids,
     gen_inds_connected,
     gen_loops,
+    gen_patches,
     gen_paths_loops,
-    gen_regions,
+    gen_gloops,
+    get_local_patch,
     get_path_between_tids,
+    get_loop_union,
     get_tree_span,
     isconnected,
     istree,
@@ -206,13 +210,15 @@ def maybe_realify_scalar(data):
 
 @functools.singledispatch
 def tensor_contract(
-    *tensors,
+    *tensors: "Tensor",
     output_inds=None,
     optimize=None,
     get=None,
     backend=None,
     preserve_tensor=False,
     drop_tags=False,
+    strip_exponent=False,
+    exponent=None,
     **contract_opts,
 ):
     """Contract a collection of tensors into a scalar or tensor, automatically
@@ -267,6 +273,11 @@ def tensor_contract(
     drop_tags : bool, optional
         Whether to drop all tags from the output tensor. By default the output
         tensor will keep the union of all tags from the input tensors.
+    strip_exponent : bool, optional
+        If `True`, return the exponent of the result, log10, as well as the
+        rescaled 'mantissa'. Useful for very large or small values.
+    exponent : float, optional
+        If supplied, an overall base exponent to scale the result by.
     contract_opts
         Passed to ``cotengra.array_contract``.
 
@@ -299,20 +310,40 @@ def tensor_contract(
         inds,
         inds_out,
         optimize=optimize,
+        strip_exponent=strip_exponent,
         backend=backend,
         **contract_opts,
     )
 
+    if strip_exponent:
+        # mantissa and exponent returned separately
+        data_out, result_exponent = data_out
+
+        if exponent is not None:
+            # custom base exponent supplied
+            result_exponent = result_exponent + exponent
+
+    elif exponent is not None:
+        # custom exponent but not stripping, so we need to scale the result
+        data_out = data_out * 10**exponent
+
     if not inds_out and not preserve_tensor:
-        return maybe_realify_scalar(data_out)
-
-    if drop_tags:
-        tags_out = None
+        # return a scalar, possibly casting to real
+        # but only if numpy with v. small imag part
+        result = maybe_realify_scalar(data_out)
     else:
-        # union of all tags
-        tags_out = oset_union(t.tags for t in tensors)
+        if drop_tags:
+            tags_out = None
+        else:
+            # union of all tags
+            tags_out = oset_union(t.tags for t in tensors)
 
-    return Tensor(data=data_out, inds=inds_out, tags=tags_out)
+        result = Tensor(data=data_out, inds=inds_out, tags=tags_out)
+
+    if strip_exponent:
+        return result, result_exponent
+
+    return result
 
 
 # generate a random base to avoid collisions on difference processes ...
@@ -434,7 +465,7 @@ def _check_left_right_isom(method, absorb):
 
 @functools.singledispatch
 def tensor_split(
-    T,
+    T: "Tensor",
     left_inds,
     method="svd",
     get=None,
@@ -627,7 +658,12 @@ def tensor_split(
 
 @functools.singledispatch
 def tensor_canonize_bond(
-    T1, T2, absorb="right", gauges=None, gauge_smudge=1e-6, **split_opts
+    T1: "Tensor",
+    T2: "Tensor",
+    absorb="right",
+    gauges=None,
+    gauge_smudge=1e-6,
+    **split_opts,
 ):
     r"""Inplace 'canonization' of two tensors. This gauges the bond between
     the two such that ``T1`` is isometric::
@@ -730,8 +766,8 @@ def choose_local_compress_gauge_settings(
 
 @functools.singledispatch
 def tensor_compress_bond(
-    T1,
-    T2,
+    T1: "Tensor",
+    T2: "Tensor",
     reduced=True,
     absorb="both",
     gauges=None,
@@ -889,7 +925,11 @@ def tensor_compress_bond(
 
 
 @functools.singledispatch
-def tensor_balance_bond(t1, t2, smudge=1e-6):
+def tensor_balance_bond(
+    t1: "Tensor",
+    t2: "Tensor",
+    smudge=1e-6
+):
     """Gauge the bond between two tensors such that the norm of the 'columns'
     of the tensors on each side is the same for each index of the bond.
 
@@ -941,7 +981,11 @@ def tensor_multifuse(ts, inds, gauges=None):
         t.fuse_({inds[0]: inds})
 
 
-def tensor_make_single_bond(t1, t2, gauges=None):
+def tensor_make_single_bond(
+    t1: "Tensor",
+    t2: "Tensor",
+    gauges=None
+):
     """If two tensors share multibonds, fuse them together and return the left
     indices, bond if it exists, and right indices. Handles simple ``gauges``.
     Inplace operation.
@@ -958,7 +1002,12 @@ def tensor_make_single_bond(t1, t2, gauges=None):
     return left, shared[0], right
 
 
-def tensor_fuse_squeeze(t1, t2, squeeze=True, gauges=None):
+def tensor_fuse_squeeze(
+    t1: "Tensor",
+    t2: "Tensor",
+    squeeze=True,
+    gauges=None,
+):
     """If ``t1`` and ``t2`` share more than one bond fuse it, and if the size
     of the shared dimenion(s) is 1, squeeze it. Inplace operation.
     """
@@ -974,7 +1023,14 @@ def tensor_fuse_squeeze(t1, t2, squeeze=True, gauges=None):
             t2 *= s0_1_2
 
 
-def new_bond(T1, T2, size=1, name=None, axis1=0, axis2=0):
+def new_bond(
+    T1: "Tensor",
+    T2: "Tensor",
+    size=1,
+    name=None,
+    axis1=0,
+    axis2=0,
+):
     """Inplace addition of a new bond between tensors ``T1`` and ``T2``. The
     size of the new bond can be specified, in which case the new array parts
     will be filled with zeros.
@@ -1058,7 +1114,12 @@ def array_direct_product(X, Y, sum_axes=()):
     return pX + pY
 
 
-def tensor_direct_product(T1, T2, sum_inds=(), inplace=False):
+def tensor_direct_product(
+    T1: "Tensor",
+    T2: "Tensor",
+    sum_inds=(),
+    inplace=False,
+):
     """Direct product of two Tensors. Any axes included in ``sum_inds`` must be
     the same size and will be summed over rather than concatenated. Summing
     over contractions of TensorNetworks equates to contracting a TensorNetwork
@@ -1102,7 +1163,11 @@ def tensor_direct_product(T1, T2, sum_inds=(), inplace=False):
     return new_T
 
 
-def tensor_network_sum(tnA, tnB, inplace=False):
+def tensor_network_sum(
+    tnA: "TensorNetwork",
+    tnB: "TensorNetwork",
+    inplace=False,
+):
     """Sum of two tensor networks, whose indices should match exactly, using
     direct products.
 
@@ -1141,7 +1206,10 @@ def tensor_network_sum(tnA, tnB, inplace=False):
     return tnAB
 
 
-def bonds(t1, t2):
+def bonds(
+    t1: "Tensor",
+    t2: "Tensor",
+):
     """Getting any indices connecting the Tensor(s) or TensorNetwork(s) ``t1``
     and ``t2``.
     """
@@ -1158,14 +1226,20 @@ def bonds(t1, t2):
     return ix1 & ix2
 
 
-def bonds_size(t1, t2):
+def bonds_size(
+    t1: "Tensor",
+    t2: "Tensor",
+):
     """Get the size of the bonds linking tensors or tensor networks ``t1`` and
     ``t2``.
     """
     return t1.inds_size(bonds(t1, t2))
 
 
-def group_inds(t1, t2):
+def group_inds(
+    t1: "Tensor",
+    t2: "Tensor",
+):
     """Group bonds into left only, shared, and right only. If ``t1`` or ``t2``
     are ``TensorNetwork`` objects, then only outer indices are considered.
 
@@ -1209,7 +1283,12 @@ def group_inds(t1, t2):
     return left_inds, shared_inds, right_inds
 
 
-def connect(t1, t2, ax1, ax2):
+def connect(
+    t1: "Tensor",
+    t2: "Tensor",
+    ax1,
+    ax2,
+):
     """Connect two tensors by setting a shared index for the specified
     dimensions. This is an inplace operation that will also affect any tensor
     networks viewing these tensors.
@@ -1279,6 +1358,7 @@ def maybe_unwrap(
     t,
     preserve_tensor_network=False,
     preserve_tensor=False,
+    strip_exponent=False,
     equalize_norms=False,
     output_inds=None,
 ):
@@ -1297,6 +1377,9 @@ def maybe_unwrap(
     preserve_tensor : bool, optional
         If ``True``, then don't unwrap a ``Tensor`` to a scalar even if it has
         no indices.
+    strip_exponent : bool, optional
+        If ``True``, then return the overall exponent of the contraction, in
+        log10, as well as the 'mantissa' tensor or scalar.
     equalize_norms : bool, optional
         If ``True``, then equalize the norms of all tensors in the tensor
         network before unwrapping.
@@ -1305,29 +1388,50 @@ def maybe_unwrap(
 
     Returns
     -------
-    TensorNetwork, Tensor or Number
+    TensorNetwork, Tensor or scalar
     """
+    exponent = 0.0
+
     if isinstance(t, TensorNetwork):
         if equalize_norms is True:
-            # this also redistributes the any collected norm exponent
-            t.equalize_norms_()
+            if strip_exponent:
+                # accumulate into the exponent
+                t.equalize_norms_(1.0)
+            else:
+                # this also redistributes the any collected norm exponent
+                t.equalize_norms_()
 
         if preserve_tensor_network or (t.num_tensors != 1):
             return t
 
+        if strip_exponent:
+            # extract from tn
+            exponent += t.exponent
+
         # else get the single tensor
         (t,) = t.tensor_map.values()
 
+    # now we have Tensor
     if output_inds is not None and t.inds != output_inds:
         t.transpose_(*output_inds)
 
+    if strip_exponent:
+        tnorm = t.norm()
+        t /= tnorm
+        exponent += do("log10", tnorm)
+
     if preserve_tensor or t.ndim != 0:
         # return as a tensor
-        return t
+        result = t
+    else:
+        # else return as a scalar, maybe dropping imaginary part
+        result = maybe_realify_scalar(t.data)
 
-    # else return as a scalar, maybe dropping imaginary part
-    return maybe_realify_scalar(t.data)
+    if strip_exponent:
+        # return mantissa and exponent separately
+        return result, exponent
 
+    return result
 
 # --------------------------------------------------------------------------- #
 #                                Tensor Class                                 #
@@ -1945,6 +2049,11 @@ class Tensor:
         return getattr(self._data, "dtype", None)
 
     @property
+    def dtype_name(self):
+        """The name of the data type of the array elements."""
+        return get_dtype_name(self._data)
+
+    @property
     def backend(self):
         """The backend inferred from the data."""
         return infer_backend(self._data)
@@ -2312,11 +2421,22 @@ class Tensor:
         G,
         ind,
         preserve_inds=True,
+        transposed=False,
         inplace=False,
     ):
-        """Gate this tensor - contract a matrix into one of its indices without
+        r"""Gate this tensor - contract a matrix into one of its indices without
         changing its indices. Unlike ``contract``, ``G`` is a raw array and the
-        tensor remains with the same set of indices.
+        tensor remains with the same set of indices. This is like applying:
+
+        .. math::
+
+            x \leftarrow G x
+
+        or if ``transposed=True``:
+
+        .. math::
+
+            x \leftarrow x G
 
         Parameters
         ----------
@@ -2324,6 +2444,12 @@ class Tensor:
             The matrix to gate the tensor index with.
         ind : str
             Which index to apply the gate to.
+        preserve_inds : bool, optional
+            If ``True``, the order of the indices is preserved, otherwise the
+            gated index will be left at the first axis, avoiding a transpose.
+        transposed : bool, optional
+            If ``True``, the gate is effectively transpose and applied, or
+            equivalently, contracted to its left rather than right.
 
         Returns
         -------
@@ -2353,7 +2479,11 @@ class Tensor:
         t = self if inplace else self.copy()
 
         ax = t.inds.index(ind)
-        new_data = do("tensordot", G, t.data, ((1,), (ax,)))
+
+        if transposed:
+            new_data = do("tensordot", G, t.data, ((0,), (ax,)))
+        else:
+            new_data = do("tensordot", G, t.data, ((1,), (ax,)))
 
         if preserve_inds:
             # gated index is now first axis, so move it to the correct position
@@ -2702,7 +2832,7 @@ class Tensor:
         idx = np.unravel_index(flat_idx, self.shape)
         return dict(zip(self.inds, idx))
 
-    def norm(self):
+    def norm(self, squared=False, **contract_opts):
         r"""Frobenius norm of this tensor:
 
         .. math::
@@ -2712,7 +2842,35 @@ class Tensor:
         where the trace is taken over all indices. Equivalent to the square
         root of the sum of squared singular values across any partition.
         """
-        return norm_fro(self.data)
+        # NOTE: for compatibility with TN.norm, we accept contract_opts
+        norm = norm_fro(self.data)
+        if squared:
+            return norm ** 2
+        return norm
+
+    def overlap(self, other, **contract_opts):
+        r"""Overlap of this tensor with another tensor:
+
+        .. math::
+
+            \langle o | t \rangle = \mathrm{Tr} \left(o^{\dagger} t\right)
+
+        where the trace is taken over all indices.
+
+        Parameters
+        ----------
+        other : Tensor or TensorNetwork
+            The other tensor or network to overlap with. This tensor will be
+            conjugated.
+
+        Returns
+        -------
+        scalar
+        """
+        if isinstance(other, Tensor):
+            return other.conj() @ self
+        else:
+            return conj(other.overlap(self, **contract_opts))
 
     def normalize(self, inplace=False):
         T = self if inplace else self.copy()
@@ -2857,10 +3015,8 @@ class Tensor:
             raise ValueError(f"Can't find index {ind} on this tensor.")
 
         t = self if inplace else self.copy()
-        flipper = tuple(
-            slice(None, None, -1) if i == ind else slice(None) for i in t.inds
-        )
-        t.modify(apply=lambda x: x[flipper])
+        ax = t.inds.index(ind)
+        t.modify(apply=lambda x: do("flip", x, ax))
         return t
 
     flip_ = functools.partialmethod(flip, inplace=True)
@@ -3199,15 +3355,35 @@ def COPY_tree_tensors(d, inds, tags=None, dtype=float, ssa_path=None):
 def _make_promote_array_func(op, meth_name):
     @functools.wraps(getattr(np.ndarray, meth_name))
     def _promote_array_func(self, other):
-        """Use standard array func, but make sure Tensor inds match."""
+        """Use standard array func, but auto match up indices."""
         if isinstance(other, Tensor):
-            if set(self.inds) != set(other.inds):
-                raise ValueError(
-                    "The indicies of these two tensors do not "
-                    f"match: {self.inds} != {other.inds}"
-                )
+            # auto match up indices - i.e. broadcast dimensions
+            left_expand = []
+            right_expand = []
 
-            otherT = other.transpose(*self.inds)
+            for ix in self.inds:
+                if ix not in other.inds:
+                    right_expand.append(ix)
+            for ix in other.inds:
+                if ix not in self.inds:
+                    left_expand.append(ix)
+
+            # new_ind is an inplace operation -> track if we need to copy
+            copied = False
+            for ix in left_expand:
+                if not copied:
+                    self = self.copy()
+                    copied = True
+                self.new_ind(ix, axis=-1)
+
+            copied = False
+            for ix in right_expand:
+                if not copied:
+                    other = other.copy()
+                    copied = True
+                other.new_ind(ix)
+
+            otherT = other.transpose(*self.inds, inplace=copied)
 
             return Tensor(
                 data=op(self.data, otherT.data),
@@ -3259,7 +3435,7 @@ for meth_name, op in [
 
 
 def _tensor_network_gate_inds_basic(
-    tn,
+    tn: "TensorNetwork",
     G,
     inds,
     ng,
@@ -3293,6 +3469,7 @@ def _tensor_network_gate_inds_basic(
         TG = Tensor(G, inds=(*inds, *bnds), tags=tags, left_inds=bnds)
 
     if contract is False:
+        # we just attach gate to the network, no contraction:
         #
         #       │   │      <- site_ix
         #       GGGGG
@@ -3307,10 +3484,11 @@ def _tensor_network_gate_inds_basic(
     tids = tn._get_tids_from_inds(inds, "any")
 
     if (contract is True) or (len(tids) == 1):
+        # everything is contracted, no need to split anything:
         #
-        #       │╱  │╱
-        #     ──GGGGG──
-        #      ╱   ╱
+        #       │╱│╱
+        #     ──GGG──
+        #      ╱ ╱
         #
         tn.reindex_(reindex_map)
 
@@ -3418,8 +3596,8 @@ def _tensor_network_gate_inds_basic(
         trn = tr_L @ tr_Q
 
     # if singular values are returned (``absorb=None``) check if we should
-    #     return them via ``info``, e.g. for ``SimpleUpdate`
-    if maybe_svals and info is not None:
+    #     return them further via ``info``, e.g. for ``SimpleUpdate`
+    if maybe_svals and (info is not None):
         s = next(iter(maybe_svals)).data
         info["singular_values", bix] = s
 
@@ -3429,7 +3607,7 @@ def _tensor_network_gate_inds_basic(
 
 
 def _tensor_network_gate_inds_lazy_split(
-    tn,
+    tn: "TensorNetwork",
     G,
     inds,
     ng,
@@ -3504,7 +3682,7 @@ _VALID_GATE_CONTRACT = _BASIC_GATE_CONTRACT | _SPLIT_GATE_CONTRACT
 
 
 def tensor_network_gate_inds(
-    self,
+    self: "TensorNetwork",
     G,
     inds,
     contract=False,
@@ -3513,7 +3691,7 @@ def tensor_network_gate_inds(
     inplace=False,
     **compress_opts,
 ):
-    """Apply the 'gate' ``G`` to indices ``inds``, propagating them to the
+    r"""Apply the 'gate' ``G`` to indices ``inds``, propagating them to the
     outside, as if applying ``G @ x``.
 
     Parameters
@@ -3672,7 +3850,7 @@ def tensor_network_gate_inds(
             )
 
     if basic:
-        # no gate splitting involved
+        # no splitting of the *gate on its own* involved
         _tensor_network_gate_inds_basic(
             tn, G, inds, ng, tags, contract, isparam, info, **compress_opts
         )
@@ -4050,6 +4228,7 @@ class TensorNetwork(object):
         return self
 
     def _modify_tensor_tags(self, old, new, tid):
+        # XXX: change to generators here?
         self._unlink_tags(old - new, tid)
         self._link_tags(new - old, tid)
 
@@ -4260,8 +4439,25 @@ class TensorNetwork(object):
         self.reindex_(reindex_map)
         return self
 
-    def conj(self, mangle_inner=False, inplace=False):
-        """Conjugate all the tensors in this network (leaves all indices)."""
+    def conj(self, mangle_inner=False, output_inds=None, inplace=False):
+        """Conjugate all the tensors in this network (leave all outer indices).
+
+        Parameters
+        ----------
+        mangle_inner : {bool, str, None}, optional
+            Whether to mangle the inner indices of the network. If a string is
+            given, it will be appended to the index names.
+        output_inds : sequence of str, optional
+            If given, the indices to mangle will be restricted to those not in
+            this list. This is only needed for (hyper) tensor networks where
+            output indices are not given simply by those that appear once.
+        inplace : bool, optional
+            Whether to perform the conjugation inplace or not.
+
+        Returns
+        -------
+        TensorNetwork
+        """
         tn = self if inplace else self.copy()
 
         for t in tn:
@@ -4269,7 +4465,14 @@ class TensorNetwork(object):
 
         if mangle_inner:
             append = None if mangle_inner is True else str(mangle_inner)
-            tn.mangle_inner_(append)
+
+            # allow explicitly setting which indices to mangle
+            if output_inds is None:
+                which = None
+            else:
+                which = oset(tn.ind_map) - tags_to_oset(output_inds)
+
+            tn.mangle_inner_(append=append, which=which)
 
         # if we have fermionic data, need to phase dual outer indices
         ex_data = next(iter(tn.tensor_map.values())).data
@@ -4307,7 +4510,62 @@ class TensorNetwork(object):
         """
         return prod(t.largest_element() for t in self)
 
-    def norm(self, **contract_opts):
+    def make_norm(
+        self,
+        mangle_append="*",
+        layer_tags=("KET", "BRA"),
+        output_inds=None,
+        return_all=False,
+    ):
+        """Make the norm (squared) tensor network of this tensor network
+        ``tn.H & tn``. This deterministally mangles the inner indices of the
+        bra to avoid clashes with the ket, and also adds tags to the top and
+        bottom layers. If the tensor network has hyper outer indices, you may
+        need to specify the output indices. This allows 'hyper' norms.
+
+        Parameters
+        ----------
+        mangle_append : {str, False or None}, optional
+            How to mangle the inner indices of the bra.
+        layer_tags : (str, str), optional
+            The tags to identify the top and bottom.
+        output_inds : sequence of str, optional
+            If given, the indices to mangle will be restricted to those not in
+            this list. This is only needed for (hyper) tensor networks where
+            output indices are not given simply by those that appear once.
+        return_all : bool, optional
+            Return the norm, the ket and the bra. These are virtual, i.e. are
+            views of the same tensors.
+
+        Returns
+        -------
+        tn_norm : TensorNetwork
+        """
+        ket = self.copy()
+
+        if layer_tags:
+            ket.add_tag(layer_tags[0])
+
+        bra = ket.conj(
+            mangle_inner=mangle_append,
+            output_inds=output_inds,
+        )
+        if layer_tags:
+            bra.retag_({layer_tags[0]: layer_tags[1]})
+
+        norm = ket.combine(
+            bra,
+            # both are already copies
+            virtual=True,
+            # mangling already avoids clashes
+            check_collisions=not mangle_append
+        )
+
+        if return_all:
+            return norm, ket, bra
+        return norm
+
+    def norm(self, output_inds=None, squared=False, **contract_opts):
         r"""Frobenius norm of this tensor network. Computed by exactly
         contracting the TN with its conjugate:
 
@@ -4318,41 +4576,109 @@ class TensorNetwork(object):
         where the trace is taken over all indices. Equivalent to the square
         root of the sum of squared singular values across any partition.
         """
-        norm = self | self.conj()
-        return norm.contract(**contract_opts) ** 0.5
+        tn_norm = self.make_norm(output_inds=output_inds, layer_tags=None)
+        norm2 = tn_norm.contract(output_inds=(), **contract_opts)
+        if squared:
+            return norm2
+        return norm2 ** 0.5
 
-    def make_norm(
+    def make_overlap(
         self,
-        mangle_append="*",
+        other,
         layer_tags=("KET", "BRA"),
+        output_inds=None,
         return_all=False,
     ):
-        """Make the norm tensor network of this tensor network ``tn.H & tn``.
+        """Make the overlap tensor network of this tensor network with another
+        tensor network `other.H & self`. This deterministally mangles the inner
+        indices of the bra to avoid clashes with the ket, and also adds tags to
+        the top and bottom layers. If the tensor network has hyper outer
+        indices, you may need to specify the output indices. This allows
+        'hyper' overlaps.
 
         Parameters
         ----------
-        mangle_append : {str, False or None}, optional
-            How to mangle the inner indices of the bra.
+        other : TensorNetwork
+            The other tensor network to overlap with, it should have the same
+            outer indices as this tensor network, all other indices will be
+            explicitly mangled in the copy taken, allowing 'hyper' overlaps.
+            This tensor network will be conjugated in the overlap.
         layer_tags : (str, str), optional
             The tags to identify the top and bottom.
+        output_inds : sequence of str, optional
+            If given, the indices to mangle will be restricted to those not in
+            this list. This is only needed for (hyper) tensor networks where
+            output indices are not given simply by those that appear once.
         return_all : bool, optional
-            Return the norm, the ket and the bra.
+            Return the overlap, the ket and the bra. These are virtual, i.e.
+            are views of the same tensors.
 
         Returns
         -------
-        norm : TensorNetwork
+        tn_overlap : TensorNetwork
         """
         ket = self.copy()
-        ket.add_tag(layer_tags[0])
+        if layer_tags:
+            ket.add_tag(layer_tags[0])
 
-        bra = ket.retag({layer_tags[0]: layer_tags[1]})
-        bra.conj_(mangle_append)
+        if output_inds is None:
+            output_inds = ket.outer_inds()
 
-        norm = ket | bra
+        bra = other.as_network().conj(
+            mangle_inner=True,
+            output_inds=output_inds,
+        )
+        if layer_tags:
+            bra.add_tag(layer_tags[1])
+
+        overlap = ket.combine(
+            bra,
+            # both are already copies
+            virtual=True,
+            # mangling already avoids clashes
+            check_collisions=False,
+        )
 
         if return_all:
-            return norm, ket, bra
-        return norm
+            return overlap, ket, bra
+
+        return overlap
+
+    def overlap(self, other, output_inds=None, **contract_opts):
+        r"""Overlap of this tensor network with another tensor network. Computed
+        by exactly contracting the TN with the conjugate of the other TN:
+
+        .. math::
+
+            \langle O, T \rangle = \mathrm{Tr} \left(O^{\dagger} T\right)
+
+        where the trace is taken over all indices. This supports 'hyper'
+        tensor networks, where the output indices are not simply those that
+        appear once.
+
+        Parameters
+        ----------
+        other : TensorNetwork
+            The other tensor network to overlap with, it should have the same
+            outer indices as this tensor network, all other indices will be
+            explicitly mangled in the copy taken, allowing 'hyper' overlaps.
+            This tensor network will be conjugated in the overlap.
+        output_inds : sequence of str, optional
+            If given, the indices to mangle will be restricted to those not in
+            this list. This is only needed for (hyper) tensor networks where
+            output indices are not given simply by those that appear once.
+        contract_opts
+            Supplied to :meth:`~quimb.tensor.tensor_contract` for the
+            contraction.
+
+        Returns
+        -------
+        scalar
+        """
+        tn_overlap = self.make_overlap(
+            other, output_inds=output_inds, layer_tags=None
+        )
+        return tn_overlap.contract(output_inds=(), **contract_opts)
 
     def multiply(self, x, inplace=False, spread_over=8):
         """Scalar multiplication of this tensor network with ``x``.
@@ -4754,10 +5080,9 @@ class TensorNetwork(object):
         """Get a copy or a virtual copy (doesn't copy the tensors) of this
         ``TensorNetwork``, only with the tensors corresponding to ``tids``.
         """
-        tn = TensorNetwork(())
+        tn = self.new(like=self)
         for tid in tids:
             tn.add_tensor(self.tensor_map[tid], tid=tid, virtual=virtual)
-        tn.view_like_(self)
         return tn
 
     def _select_without_tids(self, tids, virtual=True):
@@ -4834,26 +5159,80 @@ class TensorNetwork(object):
         self,
         tids,
         max_distance=1,
+        mode="graphdistance",
         fillin=False,
+        grow_from="all",
         reduce_outer=None,
-        inwards=False,
         virtual=True,
         include=None,
         exclude=None,
     ):
-        span = self.get_tree_span(
-            tids,
-            max_distance=max_distance,
-            include=include,
-            exclude=exclude,
-            inwards=inwards,
-        )
-        local_tids = oset(tids)
-        for s in span:
-            local_tids.add(s[0])
-            local_tids.add(s[1])
+        """Select a local region of tensors, based on graph distance or union
+        of loops, from an initial set of tensor ids.
+
+        Parameters
+        ----------
+        tids : sequence of str
+            The initial tensor ids.
+        max_distance : int, optional
+            The maximum distance to the initial tagged region, or if using
+            'loopunion' mode, the maximum size of any loop.
+        mode : {'graphdistance', 'loopunion'}, optional
+            How to select the local tensors, either by graph distance or by
+            selecting the union of all loopy regions containing ``tids``.
+        fillin : bool or int, optional
+            Whether to fill in the local patch with additional tensors, or not.
+            `fillin` tensors are those connected by two or more bonds to the
+            original local patch, the process is repeated int(fillin) times.
+        grow_from : {"all", "any"}, optional
+            If mode is 'loopunion', whether each loop should contain *all* of
+            the initial tids, or just *any* of them (generating a larger
+            region).
+        reduce_outer : {'sum', 'svd', 'svd-sum', 'reflect'}, optional
+            Whether and how to reduce any outer indices of the selected region.
+        virtual : bool, optional
+            Whether the returned tensor network should be a view of the tensors
+            or a copy.
+        include : None or sequence of int, optional
+            If given, only include tensor from this set of tids.
+        exclude : None or sequence of int, optional
+            If given, always exclude tensors from this set of tids.
+
+        Returns
+        -------
+        TensorNetwork
+        """
+        if mode == "graphdistance":
+            # get all tids up to max_distance graph distance away
+            local_tids = self.get_local_patch(
+                tids,
+                max_distance=max_distance,
+                include=include,
+                exclude=exclude,
+            )
+        elif mode == "loopunion":
+            if include is not None or exclude is not None:
+                raise ValueError(
+                    "`include` and `exclude` not "
+                    "supported for `loopunion` mode yet."
+                )
+            local_tids = self.get_loop_union(
+                tids,
+                max_size=max_distance,
+                grow_from=grow_from,
+            )
+        else:
+            raise ValueError(
+                "`mode` must be `graphdistance` or `loopunion`."
+            )
 
         for _ in range(int(fillin)):
+            # find any tids that are connected to the local region by two or
+            # more bonds and include them, repeat process `fillin` times
+
+            if not isinstance(local_tids, oset):
+                local_tids = oset(local_tids)
+
             connectivity = frequencies(
                 tid_n
                 for tid in local_tids
@@ -4922,7 +5301,9 @@ class TensorNetwork(object):
         tags,
         which="all",
         max_distance=1,
+        mode="graphdistance",
         fillin=False,
+        grow_from="all",
         reduce_outer=None,
         virtual=True,
         include=None,
@@ -4938,7 +5319,12 @@ class TensorNetwork(object):
         which : {'all', 'any', '!all', '!any'}, optional
             Whether to require matching all or any of the tags.
         max_distance : int, optional
-            The maximum distance to the initial tagged region.
+            The maximum distance to the initial tagged region, or if using
+            'loopunion' mode, the maximum size of any loop.
+        mode : {'graphdistance', 'loopunion'}, optional
+            How to select the local tensors, either by graph distance or by
+            selecting the union of all loopy regions containing ``where``, of
+            size up to ``max_distance``, ensuring no dangling tensors.
         fillin : bool or int, optional
             Once the local region has been selected based on graph distance,
             whether and how many times to 'fill-in' corners by adding tensors
@@ -4948,12 +5334,16 @@ class TensorNetwork(object):
                   fillin=0       fillin=1       fillin=2
 
                  | | | | |      | | | | |      | | | | |
-                -o-o-x-o-o-    -o-x-x-x-o-    -x-x-x-x-x-
+                -o-o-X-o-o-    -o-X-X-X-o-    -X-X-X-X-X-
                  | | | | |      | | | | |      | | | | |
-                -o-x-x-x-o-    -x-x-x-x-x-    -x-x-x-x-x-
+                -o-X-X-X-o-    -X-X-X-X-X-    -X-X-X-X-X-
                  | | | | |      | | | | |      | | | | |
-                -x-x-R-x-x-    -x-x-R-x-x-    -x-x-R-x-x-
+                -X-X-R-X-X-    -X-X-R-X-X-    -X-X-R-X-X-
 
+        grow_from : {"all", "any"}, optional
+            If mode is 'loopunion', whether each loop should contain *all* of
+            the initial tagged tensors, or just *any* of them (generating a
+            larger region).
         reduce_outer : {'sum', 'svd', 'svd-sum', 'reflect'}, optional
             Whether and how to reduce any outer indices of the selected region.
         virtual : bool, optional
@@ -4977,7 +5367,9 @@ class TensorNetwork(object):
         return self._select_local_tids(
             tids=self._get_tids_from_tags(tags, which),
             max_distance=max_distance,
+            mode=mode,
             fillin=fillin,
+            grow_from=grow_from,
             reduce_outer=reduce_outer,
             virtual=virtual,
             include=include,
@@ -6423,6 +6815,15 @@ class TensorNetwork(object):
 
         return neighbors
 
+    def get_tid_neighbor_map(self):
+        """Get a mapping of each tensor id to the tensor ids of its neighbors."""
+        neighbor_map = {tid: [] for tid in self.tensor_map}
+        for ix, tids in self.ind_map.items():
+            for tida, tidb in itertools.combinations(tids, 2):
+                neighbor_map[tida].append(tidb)
+                neighbor_map[tidb].append(tida)
+        return neighbor_map
+
     def _get_neighbor_inds(self, inds):
         """Get the indices connected to the index(es) at ``inds``.
 
@@ -6473,9 +6874,12 @@ class TensorNetwork(object):
     gen_all_paths_between_tids = gen_all_paths_between_tids
     gen_inds_connected = gen_inds_connected
     gen_loops = gen_loops
+    gen_patches = gen_patches
     gen_paths_loops = gen_paths_loops
-    gen_regions = gen_regions
+    gen_gloops = gen_gloops
+    get_local_patch = get_local_patch
     get_path_between_tids = get_path_between_tids
+    get_loop_union = get_loop_union
     get_tree_span = get_tree_span
     isconnected = isconnected
     istree = istree
@@ -6848,11 +7252,17 @@ class TensorNetwork(object):
         gauges=None,
         equalize_norms=False,
         touched_tids=None,
+        info=None,
         progbar=False,
         inplace=False,
     ):
         """Iterative gauge all the bonds in this tensor network with a 'simple
-        update' like strategy.
+        update' like strategy. If gauges are not supplied they are initialized
+        and then reabsorbed at the end, in which case this method acts as a
+        kind of conditioning. More usefully, if you supply `gauges` then they
+        will be updated inplace and *not* absorbed back into the tensor
+        network, with the assumption that you are using/tracking them
+        externally.
 
         Parameters
         ----------
@@ -6861,9 +7271,9 @@ class TensorNetwork(object):
         tol : float, optional
             The convergence tolerance for the singular values.
         smudge : float, optional
-            The smudge factor to add to the singular values when gauging.
+            A small value to add to the singular values when gauging.
         power : float, optional
-            The power to raise the singular values to when gauging.
+            A power to raise the singular values to when gauging.
         damping : float, optional
             The damping factor to apply to the gauging updates.
         gauges : dict, optional
@@ -6872,6 +7282,13 @@ class TensorNetwork(object):
             Whether to equalize the norms of the tensors after each update.
         touched_tids : sequence of int, optional
             The tensor identifiers to start the gauge sweep from.
+        info : dict, optional
+            Store extra information about the gauging process in this dict.
+            If supplied, the following keys are filled:
+
+            - 'iterations': the number of iterations performed.
+            - 'max_sdiff': the maximum singular value difference.
+
         progbar : bool, optional
             Whether to show a progress bar.
         inplace : bool, optional
@@ -6880,6 +7297,11 @@ class TensorNetwork(object):
         Returns
         -------
         TensorNetwork
+
+        See Also
+        --------
+        gauge_simple_insert, gauge_simple_remove, gauge_simple_temp,
+        gauge_all_canonize
         """
         tn = self if inplace else self.copy()
 
@@ -6902,7 +7324,7 @@ class TensorNetwork(object):
         }[(power == 1.0, smudge == 0.0)]
 
         # for retrieving singular values
-        info = {}
+        sub_info = {}
 
         # accrue scaling to avoid numerical blow-ups
         nfact = 0.0
@@ -6985,10 +7407,10 @@ class TensorNetwork(object):
 
                 # perform SVD to get new bond gauge
                 tensor_compress_bond(
-                    t1, t2, absorb=None, info=info, cutoff=0.0
+                    t1, t2, absorb=None, info=sub_info, cutoff=0.0
                 )
 
-                s = info["singular_values"]
+                s = sub_info["singular_values"]
                 snorm = do("linalg.norm", s)
                 new_gauge = s / snorm
                 nfact = do("log10", snorm) + nfact
@@ -7057,6 +7479,10 @@ class TensorNetwork(object):
                 s_1_2 = s**0.5
                 t1.multiply_index_diagonal_(ix, s_1_2)
                 t2.multiply_index_diagonal_(ix, s_1_2)
+
+        if info is not None:
+            info["iterations"] = it
+            info["max_sdiff"] = max_sdiff
 
         return tn
 
@@ -7131,9 +7557,9 @@ class TensorNetwork(object):
         self,
         tids,
         max_distance=1,
+        mode="graphdistance",
         max_iterations="max_distance",
         method="canonize",
-        inwards=False,
         include=None,
         exclude=None,
         **gauge_local_opts,
@@ -7147,7 +7573,7 @@ class TensorNetwork(object):
         tn_loc = self._select_local_tids(
             tids,
             max_distance=max_distance,
-            inwards=inwards,
+            mode=mode,
             virtual=True,
             include=include,
             exclude=exclude,
@@ -7212,7 +7638,10 @@ class TensorNetwork(object):
         remove : bool, optional
             Whether to remove the gauges from the store after inserting them.
         smudge : float, optional
-            A small value to add to the gauge vectors to avoid singularities.
+            A small value to add to the gauge vectors to avoid singularities
+            when inserting.
+        power : float, optional
+            A power to raise the gauge vectors to when inserting.
 
         Returns
         -------
@@ -7292,6 +7721,10 @@ class TensorNetwork(object):
             The store of gauge bonds, the keys being indices and the values
             being the vectors. Only bonds present in this dictionary will be
             gauged.
+        smudge : float, optional
+            A small value to add to the gauge vectors to avoid singularities.
+        power : float, optional
+            A power to raise the gauge vectors to when inserting.
         ungauge_outer : bool, optional
             Whether to ungauge the outer bonds.
         ungauge_inner : bool, optional
@@ -7360,7 +7793,8 @@ class TensorNetwork(object):
         compress_matrices=True,
         compress_exclude=None,
         compress_opts=None,
-        equalize_norms=False,
+        strip_exponent=False,
+        equalize_norms="auto",
         gauges=None,
         gauge_smudge=1e-6,
         callback_pre_contract=None,
@@ -7399,6 +7833,11 @@ class TensorNetwork(object):
         if (canonize_distance == -1) and (gauges is None):
             gauges = True
             canonize_distance = 0
+
+        if equalize_norms == "auto":
+            # if we are going to extract exponent at end, assume we
+            # should do it throughout the computation as well
+            equalize_norms = strip_exponent
 
         if gauges is True:
             gauges = {}
@@ -7620,6 +8059,7 @@ class TensorNetwork(object):
             tn,
             preserve_tensor_network=inplace,
             preserve_tensor=preserve_tensor,
+            strip_exponent=strip_exponent,
             equalize_norms=equalize_norms,
             output_inds=output_inds,
         )
@@ -7764,7 +8204,8 @@ class TensorNetwork(object):
         compress_matrices=True,
         compress_exclude=None,
         compress_opts=None,
-        equalize_norms=False,
+        strip_exponent=False,
+        equalize_norms="auto",
         gauges=None,
         gauge_smudge=1e-6,
         callback_pre_contract=None,
@@ -7859,8 +8300,14 @@ class TensorNetwork(object):
             Whether to compress pairs of tensors that are effectively matrices.
         compress_exclude : set[int], optional
             An explicit set of tensor ids to exclude from compression.
-        equalize_norms : bool or float, optional
-            Whether to equalize the norms of the tensors after each operation.
+        strip_exponent : bool, optional
+            Whether the strip an overall exponent, log10, from the *final*
+            contraction. If a TensorNetwork is returned, this exponent is
+            accumulated in the `exponent` attribute. If a Tensor or scalar is
+            returned, the exponent is returned separately.
+        equalize_norms : bool or "auto", optional
+             Whether to equalize the norms of the tensors *during* the
+            contraction. By default ("auto") this follows `strip_exponent`.
             The overall scaling is accumulated, log10, into `tn.exponent`. If
             `True`, at the end this exponent is redistributed. If a float,
             this is the target norm to equalize tensors to, e.g. `1.0`, and the
@@ -7960,6 +8407,7 @@ class TensorNetwork(object):
             compress_span=compress_span,
             compress_matrices=compress_matrices,
             compress_exclude=compress_exclude,
+            strip_exponent=strip_exponent,
             equalize_norms=equalize_norms,
             gauges=gauges,
             gauge_smudge=gauge_smudge,
@@ -8333,6 +8781,8 @@ class TensorNetwork(object):
         optimize=None,
         get=None,
         backend=None,
+        strip_exponent=False,
+        equalize_norms="auto",
         preserve_tensor=False,
         inplace=False,
         **contract_opts,
@@ -8382,6 +8832,14 @@ class TensorNetwork(object):
         backend : {'auto', 'numpy', 'jax', 'cupy', 'tensorflow', ...}, optional
             Which backend to use to perform the contraction. Supplied to
             `cotengra`.
+        strip_exponent : bool, optional
+            Whether the strip an overall exponent, log10, from the *final*
+            contraction. If a TensorNetwork is returned, this exponent is
+            accumulated in the `exponent` attribute. If a Tensor or scalar is
+            returned, the exponent is returned separately.
+        equalize_norms : bool or "auto", optional
+            Whether to equalize the norms of the tensors *during* the
+            contraction. By default ("auto") this follows `strip_exponent`.
         preserve_tensor : bool, optional
             Whether to return a tensor regardless of whether the output object
             is a scalar (has no indices) or not.
@@ -8412,6 +8870,11 @@ class TensorNetwork(object):
                 "(Change this to a no-op maybe?)"
             )
 
+        if equalize_norms == "auto":
+            # if we are going to extract exponent at end, assume we
+            # should do it throughout the computation as well
+            equalize_norms = strip_exponent
+
         # whether we should let tensor_contract return a raw scalar
         preserve_tensor = preserve_tensor or inplace or (tn.num_tensors >= 1)
 
@@ -8421,16 +8884,46 @@ class TensorNetwork(object):
             optimize=optimize,
             get=get,
             backend=backend,
+            strip_exponent=equalize_norms,
             preserve_tensor=preserve_tensor,
             **contract_opts,
         )
 
+        if equalize_norms:
+            # exponent already returned separately
+            t, exponent = t
+        elif strip_exponent:
+            # explicitly remove exponent now
+            if isinstance(t, Tensor):
+                tnorm = t.norm()
+            else:
+                # already scalar
+                tnorm = do("abs", t)
+
+            t /= tnorm
+            exponent = do("log10", tnorm)
+        else:
+            exponent = None
+
         if (tn.num_tensors == 0) and (not inplace):
             # contracted all down to single tensor or scalar -> return it
             # (apart from if inplace -> we want to keep the tensor network)
+            if exponent is not None:
+                if strip_exponent:
+                    # return separately
+                    return t, exponent
+
+                # scale by stripped exponent directly
+                t = t * 10**exponent
+
             return t
 
         tn.add_tensor(t, virtual=True)
+
+        if exponent is not None:
+            # scale by stripped exponent lazily
+            tn.exponent += exponent
+
         return tn
 
     contract_tags_ = functools.partialmethod(contract_tags, inplace=True)
@@ -8441,11 +8934,12 @@ class TensorNetwork(object):
         output_inds=None,
         optimize=None,
         get=None,
-        backend=None,
-        preserve_tensor=False,
         max_bond=None,
+        strip_exponent=False,
+        preserve_tensor=False,
+        backend=None,
         inplace=False,
-        **opts,
+        **kwargs,
     ):
         """Contract some, or all, of the tensors in this network. This method
         dispatches to ``contract_tags``, ``contract_structured``, or
@@ -8490,16 +8984,21 @@ class TensorNetwork(object):
               with detailed information such as flop cost. The symbol-map is
               also added to the ``quimb_symbol_map`` attribute.
 
-        backend : {'auto', 'numpy', 'jax', 'cupy', 'tensorflow', ...}, optional
-            Which backend to use to perform the contraction. Supplied to
-            `cotengra`.
+        strip_exponent : bool, optional
+            Whether the strip an overall exponent, log10, from the *final*
+            contraction. If a TensorNetwork is returned, this exponent is
+            accumulated in the `exponent` attribute. If a Tensor or scalar is
+            returned, the exponent is returned separately.
         preserve_tensor : bool, optional
             Whether to return a tensor regardless of whether the output object
             is a scalar (has no indices) or not.
+        backend : {'auto', 'numpy', 'jax', 'cupy', 'tensorflow', ...}, optional
+            Which backend to use to perform the contraction. Supplied to
+            `cotengra`.
         inplace : bool, optional
             Whether to perform the contraction inplace. This is only valid
             if not all tensors are contracted (which doesn't produce a TN).
-        opts
+        kwargs
             Passed to :func:`~quimb.tensor.tensor_core.tensor_contract`,
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.contract_compressed`
             .
@@ -8514,38 +9013,59 @@ class TensorNetwork(object):
         --------
         contract_tags, contract_cumulative
         """
-        opts["output_inds"] = output_inds
-        opts["optimize"] = optimize
-        opts["get"] = get
-        opts["backend"] = backend
-        opts["preserve_tensor"] = preserve_tensor
+        # for visibility we put these in the function signature
+        kwargs["output_inds"] = output_inds
+        kwargs["optimize"] = optimize
+        kwargs["get"] = get
+        kwargs["backend"] = backend
+        kwargs["preserve_tensor"] = preserve_tensor
 
         all_tags = (tags is all) or (tags is ...)
 
         if max_bond is not None:
             if not all_tags:
                 raise NotImplementedError
-            if opts.pop("get", None) is not None:
+            if kwargs.pop("get", None) is not None:
                 raise NotImplementedError
-            if opts.pop("backend", None) is not None:
+            if kwargs.pop("backend", None) is not None:
                 raise NotImplementedError
 
             return self.contract_compressed(
-                max_bond=max_bond, inplace=inplace, **opts
+                max_bond=max_bond,
+                strip_exponent=strip_exponent,
+                inplace=inplace,
+                **kwargs,
             )
 
         # this checks whether certain TN classes have a manually specified
         #     contraction pattern (e.g. 1D along the line)
         if self._CONTRACT_STRUCTURED:
+
             if (tags is ...) or isinstance(tags, slice):
-                return self.contract_structured(tags, inplace=inplace, **opts)
+                return self.contract_structured(
+                    tags,
+                    strip_exponent=strip_exponent,
+                    inplace=inplace,
+                    **kwargs,
+                )
 
         # contracting everything to single output
         if all_tags and not inplace:
-            return tensor_contract(*self.tensor_map.values(), **opts)
+
+            return tensor_contract(
+                *self.tensor_map.values(),
+                strip_exponent=strip_exponent,
+                exponent=self.exponent,
+                **kwargs
+            )
 
         # contract some or all tensors, but keeping tensor network
-        return self.contract_tags(tags, inplace=inplace, **opts)
+        return self.contract_tags(
+            tags,
+            strip_exponent=strip_exponent,
+            inplace=inplace,
+            **kwargs
+        )
 
     contract_ = functools.partialmethod(contract, inplace=True)
 
@@ -8553,10 +9073,11 @@ class TensorNetwork(object):
         self,
         tags_seq,
         output_inds=None,
+        strip_exponent=False,
+        equalize_norms="auto",
         preserve_tensor=False,
-        equalize_norms=False,
         inplace=False,
-        **opts,
+        **contract_opts,
     ):
         """Cumulative contraction of tensor network. Contract the first set of
         tags, then that set with the next set, then both of those with the next
@@ -8571,12 +9092,20 @@ class TensorNetwork(object):
             The indices to specify as outputs of the contraction. If not given,
             and the tensor network has no hyper-indices, these are computed
             automatically as every index appearing once.
+        strip_exponent : bool, optional
+            Whether the strip an overall exponent, log10, from the *final*
+            contraction. If a TensorNetwork is returned, this exponent is
+            accumulated in the `exponent` attribute. If a Tensor or scalar is
+            returned, the exponent is returned separately.
+        equalize_norms : bool or "auto", optional
+            Whether to equalize the norms of the tensors *during* the
+            contraction. By default ("auto") this follows `strip_exponent`.
         preserve_tensor : bool, optional
             Whether to return a tensor regardless of whether the output object
             is a scalar (has no indices) or not.
         inplace : bool, optional
             Whether to perform the contraction inplace.
-        opts
+        contract_opts
             Passed to :func:`~quimb.tensor.tensor_core.tensor_contract`.
 
         Returns
@@ -8592,12 +9121,22 @@ class TensorNetwork(object):
         tn = self if inplace else self.copy()
         c_tags = oset()
 
+        if equalize_norms == "auto":
+            # if we are going to extract exponent at end, assume we
+            # should do it throughout the computation as well
+            equalize_norms = strip_exponent
+
         for tags in tags_seq:
             # accumulate tags from each contractions
             c_tags |= tags_to_oset(tags)
 
             # peform the next contraction
-            tn.contract_tags_(c_tags, which="any", **opts)
+            tn.contract_tags_(
+                c_tags,
+                which="any",
+                equalize_norms=equalize_norms,
+                **contract_opts
+            )
 
             if tn.num_tensors == 1:
                 # nothing more to contract
@@ -8607,6 +9146,7 @@ class TensorNetwork(object):
             tn,
             preserve_tensor_network=inplace,
             preserve_tensor=preserve_tensor,
+            strip_exponent=strip_exponent,
             equalize_norms=equalize_norms,
             output_inds=output_inds,
         )
@@ -8996,7 +9536,8 @@ class TensorNetwork(object):
 
         # then form the 'oblique' projectors
         Pl, Pr = decomp.compute_oblique_projectors(
-            Rl, Rr,
+            Rl,
+            Rr,
             max_bond=max_bond,
             cutoff=cutoff,
             **compress_opts,
@@ -9064,10 +9605,17 @@ class TensorNetwork(object):
         ----------
         tn_target : TensorNetwork
             The target tensor network to try and fit the current one to.
-        method : {'als', 'autodiff'}, optional
-            Whether to use alternating least squares (ALS) or automatic
-            differentiation to perform the optimization. Generally ALS is
-            better for simple geometries, autodiff better for complex ones.
+        method : {'als', 'autodiff', 'tree'}, optional
+            How to perform the fitting. The options are:
+
+            - 'als': alternating least squares (ALS) optimization,
+            - 'autodiff': automatic differentiation optimization,
+            - 'tree': ALS where the fitted tensor network has a tree structure
+              and thus a canonical form can be utilized for much greater
+              efficiency and stability.
+
+            Generally ALS is better for simple geometries, autodiff better for
+            complex ones. Tree best if the tensor network has a tree structure.
         tol : float, optional
             The target norm distance.
         inplace : bool, optional
@@ -9076,8 +9624,9 @@ class TensorNetwork(object):
             Show a live progress bar of the fitting process.
         fitting_opts
             Supplied to either
-            :func:`~quimb.tensor.tensor_core.tensor_network_fit_als` or
-            :func:`~quimb.tensor.tensor_core.tensor_network_fit_autodiff`.
+            :func:`~quimb.tensor.tensor_core.tensor_network_fit_als`,
+            :func:`~quimb.tensor.tensor_core.tensor_network_fit_autodiff`, or
+            :func:`~quimb.tensor.tensor_core.tensor_network_fit_tree`.
 
         Returns
         -------
@@ -9087,18 +9636,26 @@ class TensorNetwork(object):
         See Also
         --------
         tensor_network_fit_als, tensor_network_fit_autodiff,
-        tensor_network_distance
+        tensor_network_fit_tree, tensor_network_distance,
+        tensor_network_1d_compress
         """
-        check_opt("method", method, ("als", "autodiff"))
         fitting_opts["tol"] = tol
         fitting_opts["inplace"] = inplace
         fitting_opts["progbar"] = progbar
 
         tn_target = tn_target.as_network()
 
+        if method == "als":
+            return tensor_network_fit_als(self, tn_target, **fitting_opts)
         if method == "autodiff":
             return tensor_network_fit_autodiff(self, tn_target, **fitting_opts)
-        return tensor_network_fit_als(self, tn_target, **fitting_opts)
+        elif method == "tree":
+            return tensor_network_fit_tree(self, tn_target, **fitting_opts)
+        else:
+            raise ValueError(
+                f"Unrecognized method {method}. Should be one of: "
+                "{'als', 'autodiff', 'tree'}."
+            )
 
     fit_ = functools.partialmethod(fit, inplace=True)
 
@@ -9374,7 +9931,7 @@ class TensorNetwork(object):
 
     randomize_ = functools.partialmethod(randomize, inplace=True)
 
-    def strip_exponent(self, tid_or_tensor, value=None):
+    def strip_exponent(self, tid_or_tensor, value=None, check_zero=False):
         """Scale the elements of tensor corresponding to ``tid`` so that the
         norm of the array is some value, which defaults to ``1``. The log of
         the scaling factor, base 10, is then accumulated in the ``exponent``
@@ -9386,6 +9943,11 @@ class TensorNetwork(object):
             The tensor identifier or actual tensor.
         value : None or float, optional
             The value to scale the norm of the tensor to.
+        check_zero : bool, optional
+            Whether to check if the tensor has zero norm and in that case do
+            nothing, since the `exponent` would be -inf. Off by default to
+            avoid data dependent computational graphs when tracing and
+            computing gradients etc.
         """
         if (value is None) or (value is True):
             value = 1.0
@@ -9396,6 +9958,10 @@ class TensorNetwork(object):
             t = self.tensor_map[tid_or_tensor]
 
         stripped_factor = t.norm() / value
+
+        if check_zero and (stripped_factor == 0.0):
+            return
+
         t.modify(apply=lambda data: data / stripped_factor)
         self.exponent = self.exponent + do("log10", stripped_factor)
 
@@ -9410,7 +9976,7 @@ class TensorNetwork(object):
         # reset the exponent to zero
         self.exponent = 0.0
 
-    def equalize_norms(self, value=None, inplace=False):
+    def equalize_norms(self, value=None, check_zero=False, inplace=False):
         """Make the Frobenius norm of every tensor in this TN equal without
         changing the overall value if ``value=None``, or set the norm of every
         tensor to ``value`` by scalar multiplication only.
@@ -9421,6 +9987,11 @@ class TensorNetwork(object):
             Set the norm of each tensor to this value specifically. If supplied
             the change in overall scaling will be accumulated in
             ``tn.exponent`` in the form of a base 10 power.
+        check_zero : bool, optional
+            Whether, if and when equalizing norms, to check if tensors have
+            zero norm and in that case do nothing, since the `exponent` would
+            be -inf. Off by default to avoid data dependent computational
+            graphs when tracing and computing gradients etc.
         inplace : bool, optional
             Whether to perform the norm equalization inplace or not.
 
@@ -9431,7 +10002,7 @@ class TensorNetwork(object):
         tn = self if inplace else self.copy()
 
         for tid in tn.tensor_map:
-            tn.strip_exponent(tid, value=value)
+            tn.strip_exponent(tid, value=value, check_zero=check_zero)
 
         if value is None:
             tn.distribute_exponent()
@@ -9576,6 +10147,7 @@ class TensorNetwork(object):
         equalize_norms=False,
         cache=None,
         max_combinations=500,
+        check_zero=False,
         inplace=False,
     ):
         """Simplify this tensor network by performing contractions that don't
@@ -9592,6 +10164,11 @@ class TensorNetwork(object):
             exponent in ``tn.exponent``.
         cache : None or set
             Persistent cache used to mark already checked tensors.
+        check_zero : bool, optional
+            Whether, if and when equalizing norms, to check if tensors have
+            zero norm and in that case do nothing, since the `exponent` would
+            be -inf. Off by default to avoid data dependent computational
+            graphs when tracing and computing gradients etc.
         inplace : bool, optional
             Whether to perform the rand reduction inplace.
 
@@ -9737,7 +10314,7 @@ class TensorNetwork(object):
             tn |= tab
 
             if equalize_norms:
-                tn.strip_exponent(tab, equalize_norms)
+                tn.strip_exponent(tab, equalize_norms, check_zero=check_zero)
 
             for ix in out_ab:
                 # now we need to check outputs indices again
@@ -9745,10 +10322,16 @@ class TensorNetwork(object):
 
         if scalars:
             if equalize_norms:
+                # move overall scaling factor into exponent, absorb phase
                 signs = []
                 for s in scalars:
-                    signs.append(s / do("abs", s))
-                    tn.exponent += do("log10", do("abs", s))
+                    sa = do("abs", s)
+                    if check_zero and (sa == 0.0):
+                        # whole contraction is zero
+                        signs = [0.0]
+                        break
+                    signs.append(s / sa)
+                    tn.exponent += do("log10", sa)
                 scalars = signs
 
             if tn.num_tensors:
@@ -10008,6 +10591,7 @@ class TensorNetwork(object):
         atol=1e-12,
         equalize_norms=False,
         cache=None,
+        check_zero=False,
         inplace=False,
         **split_opts,
     ):
@@ -10024,6 +10608,11 @@ class TensorNetwork(object):
             exponent in ``tn.exponent``.
         cache : None or set
             Persistent cache used to mark already checked tensors.
+        check_zero : bool, optional
+            Whether, if and when equalizing norms, to check if tensors have
+            zero norm and in that case do nothing, since the `exponent` would
+            be -inf. Off by default to avoid data dependent computational
+            graphs when tracing and computing gradients etc.
         inplace, bool, optional
             Whether to perform the split simplification inplace.
         """
@@ -10060,8 +10649,12 @@ class TensorNetwork(object):
                 tn |= tr
 
                 if equalize_norms:
-                    tn.strip_exponent(tl, equalize_norms)
-                    tn.strip_exponent(tr, equalize_norms)
+                    tn.strip_exponent(
+                        tl, equalize_norms, check_zero=check_zero
+                    )
+                    tn.strip_exponent(
+                        tr, equalize_norms, check_zero=check_zero
+                    )
 
             else:
                 cache.add(cache_key)
@@ -10078,6 +10671,7 @@ class TensorNetwork(object):
         cache=None,
         equalize_norms=False,
         max_combinations=500,
+        check_zero=False,
         inplace=False,
         **split_opts,
     ):
@@ -10165,8 +10759,8 @@ class TensorNetwork(object):
 
             tensor_fuse_squeeze(tl, tr)
             if equalize_norms:
-                tn.strip_exponent(tl, equalize_norms)
-                tn.strip_exponent(tr, equalize_norms)
+                tn.strip_exponent(tl, equalize_norms, check_zero=check_zero)
+                tn.strip_exponent(tr, equalize_norms, check_zero=check_zero)
 
             queue.extend(tl.inds)
             queue.extend(tr.inds)
@@ -10184,6 +10778,7 @@ class TensorNetwork(object):
         loops=None,
         cache=None,
         equalize_norms=False,
+        check_zero=False,
         inplace=False,
         **split_opts,
     ):
@@ -10203,6 +10798,11 @@ class TensorNetwork(object):
         cache : set, optional
             For performance reasons can supply a cache for already checked
             loops.
+        check_zero : bool, optional
+            Whether, if and when equalizing norms, to check if tensors have
+            zero norm and in that case do nothing, since the `exponent` would
+            be -inf. Off by default to avoid data dependent computational
+            graphs when tracing and computing gradients etc.
         inplace : bool, optional
             Whether to replace the loops inplace.
         split_opts
@@ -10283,8 +10883,8 @@ class TensorNetwork(object):
 
             tensor_fuse_squeeze(tl, tr)
             if equalize_norms:
-                tn.strip_exponent(tl, equalize_norms)
-                tn.strip_exponent(tr, equalize_norms)
+                tn.strip_exponent(tl, equalize_norms, check_zero=check_zero)
+                tn.strip_exponent(tr, equalize_norms, check_zero=check_zero)
 
         return tn
 
@@ -10297,13 +10897,14 @@ class TensorNetwork(object):
         atol=1e-12,
         equalize_norms=False,
         cache=None,
-        inplace=False,
-        progbar=False,
         rank_simplify_opts=None,
         loop_simplify_opts=None,
         split_simplify_opts=None,
         custom_methods=(),
         split_method="svd",
+        check_zero="auto",
+        inplace=False,
+        progbar=False,
     ):
         """Perform a series of tensor network 'simplifications' in a loop until
         there is no more reduction in the number of tensors or indices. Note
@@ -10342,6 +10943,12 @@ class TensorNetwork(object):
         cache : None or set
             A persistent cache for each simplification process to mark
             already processed tensors.
+        check_zero : bool, optional
+            Whether to check if tensors have zero norm and in that case do
+            nothing if and when equalizing norms, rather than generating a NaN.
+            If 'auto' this will only be turned on if other methods that
+            explicitly check data entries ("A", "D", "C", "S", "L") are being
+            used (the default).
         progbar : bool, optional
             Show a live progress bar of the simplification process.
         inplace : bool, optional
@@ -10367,6 +10974,10 @@ class TensorNetwork(object):
         # all the methods
         if output_inds is None:
             output_inds = self.outer_inds()
+
+        if check_zero == "auto":
+            # any method but R checks data entries anyway
+            check_zero = bool(set(seq) - {"R"})
 
         tn.squeeze_(exclude=output_inds)
 
@@ -10407,6 +11018,7 @@ class TensorNetwork(object):
                         output_inds=ix_o,
                         cache=cache,
                         equalize_norms=equalize_norms,
+                        check_zero=check_zero,
                         **rank_simplify_opts,
                     )
                 elif meth == "A":
@@ -10420,6 +11032,7 @@ class TensorNetwork(object):
                         atol=atol,
                         cache=cache,
                         equalize_norms=equalize_norms,
+                        check_zero=check_zero,
                         **split_simplify_opts,
                     )
                 elif meth == "L":
@@ -10428,6 +11041,7 @@ class TensorNetwork(object):
                         cutoff=atol,
                         cache=cache,
                         equalize_norms=equalize_norms,
+                        check_zero=check_zero,
                         **loop_simplify_opts,
                     )
                 elif meth == "P":
@@ -10436,6 +11050,7 @@ class TensorNetwork(object):
                         cutoff=atol,
                         cache=cache,
                         equalize_norms=equalize_norms,
+                        check_zero=check_zero,
                         **loop_simplify_opts,
                     )
                 else:
@@ -10447,9 +11062,10 @@ class TensorNetwork(object):
         if equalize_norms:
             if equalize_norms is True:
                 # this also redistributes the collected exponents
-                tn.equalize_norms_()
+                value = None
             else:
-                tn.equalize_norms_(value=equalize_norms)
+                value = equalize_norms
+            tn.equalize_norms_(value=value, check_zero=check_zero)
 
         if progbar:
             pbar.close()
@@ -10579,6 +11195,7 @@ class TensorNetwork(object):
         max_simplification_iterations=100,
         converged_tol=0.01,
         equalize_norms=True,
+        check_zero=True,
         progbar=False,
         inplace=False,
         **full_simplify_opts,
@@ -10591,6 +11208,7 @@ class TensorNetwork(object):
         simplify_opts = {
             "atol": atol,
             "equalize_norms": equalize_norms,
+            "check_zero": check_zero,
             "progbar": progbar,
             "output_inds": output_inds,
             "cache": set(),
@@ -10668,7 +11286,20 @@ class TensorNetwork(object):
         """The dtype of this TensorNetwork, this is the minimal common type
         of all the tensors data.
         """
+        # TODO: support non numpy dtypes here
         return get_common_dtype(*self.arrays)
+
+    @property
+    def dtype_name(self):
+        """The name of the data type of the array elements."""
+        return next(iter(self.tensor_map.values())).dtype_name
+
+    @property
+    def backend(self):
+        """Get the backend of any tensor in this network, asssuming it to be
+        the same for all tensors.
+        """
+        return next(iter(self.tensor_map.values())).backend
 
     def iscomplex(self):
         return iscomplex(self)
@@ -10817,9 +11448,8 @@ class TNLinearOperator(spla.LinearOperator):
             self._tensors = tns.tensors
 
             if ldims is None or rdims is None:
-                ix_sz = tns.ind_sizes()
-                ldims = tuple(ix_sz[i] for i in left_inds)
-                rdims = tuple(ix_sz[i] for i in right_inds)
+                ldims = tuple(map(tns.ind_size, left_inds))
+                rdims = tuple(map(tns.ind_size, right_inds))
 
         else:
             self._tensors = tuple(tns)

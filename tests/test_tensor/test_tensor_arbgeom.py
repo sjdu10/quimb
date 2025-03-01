@@ -121,8 +121,13 @@ def test_gate_sandwich_with_op():
 def test_normalize_simple():
     psi = qtn.PEPS.rand(3, 3, 2, dtype=complex)
     gauges = {}
-    psi.gauge_all_simple_(100, 5e-6, gauges=gauges)
+    info = {}
+    psi.gauge_all_simple_(100, 5e-6, gauges=gauges, info=info)
     psi.normalize_simple(gauges)
+
+    assert info["iterations"] <= 100
+    if info["iterations"] < 100:
+        assert info["max_sdiff"] < 5e-6
 
     for where in [
         [(0, 0)],
@@ -136,7 +141,8 @@ def test_normalize_simple():
         assert k.H @ k == pytest.approx(1.0)
 
 
-def test_local_expectation_loop_expansions():
+@pytest.mark.parametrize("grow_from", ["all", "any"])
+def test_local_expectation_sloop_expand(grow_from):
     import quimb as qu
 
     edges = [(0, 1), (0, 2), (2, 3), (1, 3), (2, 4), (3, 5), (4, 5)]
@@ -157,31 +163,32 @@ def test_local_expectation_loop_expansions():
     psi.normalize_simple(gauges)
 
     # test loop generation per term
-    o_c0 = psi.local_expectation_loop_expansion(
-        G, where, loops=0, gauges=gauges
+    o_c0 = psi.local_expectation_sloop_expand(
+        G, where, sloops=0, gauges=gauges
     )
     assert o_c0 == pytest.approx(
         psi.local_expectation_cluster(G, where, gauges=gauges)
     )
     assert o_ex == pytest.approx(o_c0, rel=0.5, abs=0.01)
-    o_c1 = psi.local_expectation_loop_expansion(
-        G, where, loops=4, gauges=gauges
+    o_c1 = psi.local_expectation_sloop_expand(
+        G, where, sloops=4, gauges=gauges, grow_from=grow_from
     )
     assert o_ex == pytest.approx(o_c1, rel=0.5, abs=0.01)
-    o_c2 = psi.local_expectation_loop_expansion(
-        G, where, loops=6, gauges=gauges
+    o_c2 = psi.local_expectation_sloop_expand(
+        G, where, sloops=6, gauges=gauges, grow_from=grow_from
     )
     assert o_ex == pytest.approx(o_c2, rel=0.4, abs=0.01)
 
     # test manual loops supply
-    loops = tuple(psi.gen_paths_loops(6))
-    o_cl = psi.local_expectation_loop_expansion(
-        G, where, loops=loops, gauges=gauges
+    sloops = tuple(psi.gen_paths_loops(6))
+    o_cl = psi.local_expectation_sloop_expand(
+        G, where, sloops=sloops, gauges=gauges, grow_from=grow_from
     )
     assert o_ex == pytest.approx(o_cl, rel=0.4, abs=0.01)
 
 
-def test_local_expectation_cluster_expansions():
+@pytest.mark.parametrize("grow_from", ["all", "any"])
+def test_local_expectation_gloop_expand(grow_from):
     import quimb as qu
 
     edges = [(0, 1), (0, 2), (2, 3), (1, 3), (2, 4), (3, 5), (4, 5)]
@@ -202,25 +209,25 @@ def test_local_expectation_cluster_expansions():
     psi.normalize_simple(gauges)
 
     # test cluster generation per term
-    o_c0 = psi.local_expectation_cluster_expansion(
-        G, where, clusters=0, gauges=gauges
+    o_c0 = psi.local_expectation_gloop_expand(
+        G, where, gloops=0, gauges=gauges
     )
     assert o_c0 == pytest.approx(
         psi.local_expectation_cluster(G, where, gauges=gauges)
     )
     assert o_ex == pytest.approx(o_c0, rel=0.5, abs=0.01)
-    o_c1 = psi.local_expectation_cluster_expansion(
-        G, where, clusters=4, gauges=gauges
+    o_c1 = psi.local_expectation_gloop_expand(
+        G, where, gloops=4, gauges=gauges, grow_from=grow_from
     )
     assert o_ex == pytest.approx(o_c1, rel=0.5, abs=0.01)
-    o_c2 = psi.local_expectation_cluster_expansion(
-        G, where, clusters=6, gauges=gauges
+    o_c2 = psi.local_expectation_gloop_expand(
+        G, where, gloops=6, gauges=gauges, grow_from=grow_from
     )
     assert o_ex == pytest.approx(o_c2, rel=0.4, abs=0.01)
 
-    # test manual clusters supply
-    clusters = tuple(psi.gen_regions(4))
-    o_cl = psi.local_expectation_cluster_expansion(
-        G, where, clusters=clusters, gauges=gauges
+    # test manual gloops supply
+    gloops = tuple(psi.gen_gloops(4))
+    o_cl = psi.local_expectation_gloop_expand(
+        G, where, gloops=gloops, gauges=gauges, grow_from=grow_from
     )
     assert o_ex == pytest.approx(o_cl, rel=0.4, abs=0.01)

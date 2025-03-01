@@ -3,7 +3,7 @@ channels:
   - conda-forge
 dependencies:
   - autoray>=0.6.12
-  - cotengra>=0.6.1
+  - cotengra>=0.7.1
   - coverage
   - cpuonly
   - cytoolz
@@ -16,5 +16,5 @@ dependencies:
   - pytest
   - pytest-cov
   - pytorch
-  - scipy
+  - scipy<1.15.0
   - tqdm

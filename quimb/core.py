@@ -1,12 +1,14 @@
 """Core functions for manipulating quantum objects."""
 
 import cmath
+import concurrent.futures as cf
 import functools
 import itertools
 import math
 import os
 from numbers import Integral
 
+import numba
 import numpy as np
 import scipy.sparse as sp
 
@@ -38,20 +40,6 @@ else:
 
     _NUM_THREAD_WORKERS = psutil.cpu_count(logical=False)
 
-if "NUMBA_NUM_THREADS" in os.environ:
-    if int(os.environ["NUMBA_NUM_THREADS"]) != _NUM_THREAD_WORKERS:
-        import warnings
-
-        warnings.warn(
-            "'NUMBA_NUM_THREADS' has been set elsewhere and doesn't match the "
-            "value 'quimb' has tried to set - "
-            f"{os.environ['NUMBA_NUM_THREADS']} vs {_NUM_THREAD_WORKERS}."
-        )
-else:
-    os.environ["NUMBA_NUM_THREADS"] = str(_NUM_THREAD_WORKERS)
-
-# need to set NUMBA_NUM_THREADS first
-import numba  # noqa
 
 _NUMBA_CACHE = {
     "TRUE": True,
@@ -59,33 +47,13 @@ _NUMBA_CACHE = {
     "FALSE": False,
     "OFF": False,
 }[os.environ.get("QUIMB_NUMBA_CACHE", "True").upper()]
-_NUMBA_PAR = {
-    "TRUE": True,
-    "ON": True,
-    "FALSE": False,
-    "OFF": False,
-}[os.environ.get("QUIMB_NUMBA_PARALLEL", "True").upper()]
 
 njit = functools.partial(numba.njit, cache=_NUMBA_CACHE)
 """Numba no-python jit, but obeying cache setting.
 """
 
-pnjit = functools.partial(numba.njit, cache=_NUMBA_CACHE, parallel=_NUMBA_PAR)
-"""Numba no-python jit, but obeying cache setting, with optional parallel
-target, depending on environment variable 'QUIMB_NUMBA_PARALLEL'.
-"""
-
 vectorize = functools.partial(numba.vectorize, cache=_NUMBA_CACHE)
 """Numba vectorize, but obeying cache setting.
-"""
-
-pvectorize = functools.partial(
-    numba.vectorize,
-    cache=_NUMBA_CACHE,
-    target="parallel" if _NUMBA_PAR else "cpu",
-)
-"""Numba vectorize, but obeying cache setting, with optional parallel
-target, depending on environment variable 'QUIMB_NUMBA_PARALLEL'.
 """
 
 
@@ -119,7 +87,7 @@ def get_thread_pool(num_workers=None):
     return ThreadPoolExecutor(num_workers)
 
 
-def par_reduce(fn, seq, nthreads=_NUM_THREAD_WORKERS):
+def par_reduce(fn, seq, num_threads=_NUM_THREAD_WORKERS):
     """Parallel reduce.
 
     Parameters
@@ -128,7 +96,7 @@ def par_reduce(fn, seq, nthreads=_NUM_THREAD_WORKERS):
         Two argument function to reduce with.
     seq : sequence
         Sequence to reduce.
-    nthreads : int, optional
+    num_threads : int, optional
         The number of threads to reduce with in parallel.
 
     Returns
@@ -139,10 +107,10 @@ def par_reduce(fn, seq, nthreads=_NUM_THREAD_WORKERS):
     -----
     This has a several hundred microsecond overhead.
     """
-    if nthreads == 1:
+    if num_threads == 1:
         return functools.reduce(fn, seq)
 
-    pool = get_thread_pool(nthreads)  # cached
+    pool = get_thread_pool(num_threads)  # cached
 
     def _sfn(x):
         """Single call of `fn`, but accounts for the fact
@@ -480,20 +448,163 @@ def ispos(qob, tol=1e-15):
 # --------------------------------------------------------------------------- #
 
 
-def _nb_complex_base(real, imag):  # pragma: no cover
-    return real + 1j * imag
+@njit(nogil=True)
+def threading_choose_num_blocks(size_total, target_block_size, num_threads):
+    """Given `size_total` items, `target_block_size`, and number of threads
+    `num_threads`, choose the number of blocks to split `size_total` into, the
+    base block size, and the remainder, used with `threading_get_block_range`.
+
+    Parameters
+    ----------
+    size_total : int
+        Total number of items to split.
+    target_block_size : int
+        Target block size. If positive, blocks will be at least this size. If
+        negative, blocks will be close to this size.
+    num_threads : int
+        Number of threads to split into.
+
+    Returns
+    -------
+    int, int, int
+        Number of blocks, base block size, and block remainder.
+    """
+    if num_threads == 1:
+        # always just 1 block for single thread
+        num_blocks = 1
+
+    elif target_block_size < 0:
+        # target blocks actually close to size target_block_size, for
+        # cyclically distributing work with potentially varying costs
+        target_block_size = -target_block_size
+        num_blocks = np.ceil(size_total / target_block_size)
+        if num_blocks > num_threads:
+            # round to nearest multiple of num_threads
+            num_blocks = num_threads * round(num_blocks / num_threads)
+
+    else:
+        # target blocks at least as big as target_block_size
+        num_blocks = min(num_threads, round(size_total / num_threads))
+
+    base_block_size, block_remainder = divmod(size_total, num_blocks)
+    return num_blocks, base_block_size, block_remainder
 
 
-_cmplx_sigs = ["complex64(float32, float32)", "complex128(float64, float64)"]
-_nb_complex_seq = vectorize(_cmplx_sigs)(_nb_complex_base)
-_nb_complex_par = pvectorize(_cmplx_sigs)(_nb_complex_base)
+@njit(nogil=True)
+def threading_get_block_range(b, base_block_size, block_remainder):
+    """Given block index `b`, base block size `base_block_size`, and remainder
+    `block_remainder`, return the start and stop indices of the block.
+    """
+    start = b * base_block_size + min(b, block_remainder)
+    block_size = base_block_size + (1 if b < block_remainder else 0)
+    stop = start + block_size
+    return start, stop
 
 
-def complex_array(real, imag):
+def maybe_multithread(
+    fn, *args, size_total, target_block_size, num_threads, **kwargs
+):
+    """Based on the size of the problem, either call `fn` directly or
+    get a pool and multithread it.
+    """
+    if size_total <= target_block_size:
+        # don't bother getting pool
+        fn(*args, **kwargs)
+    else:
+        if num_threads is None:
+            # get default number of threads
+            num_threads = _NUM_THREAD_WORKERS
+        pool = get_thread_pool(num_threads)
+
+        cf.wait(
+            pool.submit(
+                fn,
+                *args,
+                thread_rank=thread_rank,
+                num_threads=num_threads,
+                target_block_size=target_block_size,
+                **kwargs,
+            )
+            for thread_rank in range(num_threads)
+        )
+
+
+@njit(nogil=True)
+def _complex_array_numba(
+    x, y, out, thread_rank=0, num_threads=1, target_block_size=2**15
+):  # pragma: no cover
+    N = x.size
+
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            out[i] = complex(x[i], y[i])
+
+
+def complex_array(x, y, num_threads=None, target_block_size=2**15):
     """Accelerated creation of complex array."""
-    if real.size > 50000:
-        return _nb_complex_par(real, imag)
-    return _nb_complex_seq(real, imag)
+    if x.dtype == "float32":
+        dtype = "complex64"
+    else:
+        dtype = "complex128"
+
+    N = x.size
+    out = np.empty(N, dtype=dtype)
+
+    maybe_multithread(
+        _complex_array_numba,
+        x,
+        y,
+        out,
+        size_total=N,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
+    return out
+
+
+@njit(nogil=True)
+def _phase_to_complex_numba(
+    x, out, thread_rank=0, num_threads=1, target_block_size=2**10
+):  # pragma: no cover
+    N = x.size
+
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            xi = x[i]
+            out[i] = complex(np.cos(xi), np.sin(xi))
+
+
+def phase_to_complex(x, num_threads=None, target_block_size=2**10):
+    """Convert an array of phases to actual complex numbers."""
+    if x.dtype == "float32":
+        dtype = "complex64"
+    else:
+        dtype = "complex128"
+
+    N = x.size
+    out = np.empty(N, dtype=dtype)
+    maybe_multithread(
+        _phase_to_complex_numba,
+        x.ravel(),
+        out,
+        size_total=N,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
+    out.shape = x.shape
+    return out
 
 
 @ensure_qarray
@@ -529,64 +640,143 @@ def mul(x, y):
     return mul_dense(x, y)
 
 
-def _nb_subtract_update_base(X, c, Z):  # pragma: no cover
-    return X - c * Z
+@njit(nogil=True)
+def _subtract_update_2d_numba(
+    X, c, Y, thread_rank=0, num_threads=1, target_block_size=2**14
+):  # pragma: no cover
+    N, M = X.shape
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            for j in range(M):
+                X[i, j] -= c * Y[i, j]
 
 
-_sbtrct_sigs = [
-    "float32(float32, float32, float32)",
-    "float32(float32, float64, float32)",
-    "float64(float64, float64, float64)",
-    "complex64(complex64, float32, complex64)",
-    "complex64(complex64, float64, complex64)",
-    "complex128(complex128, float64, complex128)",
-]
-_nb_subtract_update_seq = vectorize(_sbtrct_sigs)(_nb_subtract_update_base)
-_nb_subtract_update_par = pvectorize(_sbtrct_sigs)(_nb_subtract_update_base)
+@njit(nogil=True)
+def _subtract_update_1d_numba(
+    X, c, Y, thread_rank=0, num_threads=1, target_block_size=2**14
+):  # pragma: no cover
+    (N,) = X.shape
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            X[i] -= c * Y[i]
 
 
-def subtract_update_(X, c, Y):
+def subtract_update_(X, c, Y, num_threads=None, target_block_size=2**14):
     """Accelerated inplace computation of ``X -= c * Y``. This is mainly
     for Lanczos iteration.
     """
-    if X.size > 2048:
-        _nb_subtract_update_par(X, c, Y, out=X)
+    if X.ndim == 2:
+        fn = _subtract_update_2d_numba
     else:
-        _nb_subtract_update_seq(X, c, Y, out=X)
+        fn = _subtract_update_1d_numba
+
+    maybe_multithread(
+        fn,
+        X,
+        c,
+        Y,
+        size_total=X.shape[0],
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
 
 
-def _nb_divide_update_base(X, c):  # pragma: no cover
-    return X / c
+@njit(nogil=True)
+def _divide_update_2d_numba(
+    X, c, out, thread_rank=0, num_threads=1, target_block_size=2**14
+):  # pragma: no cover
+    N, M = X.shape
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            for j in range(M):
+                out[i, j] = X[i, j] / c
 
 
-_divd_sigs = [
-    "float32(float32, float32)",
-    "float64(float64, float64)",
-    "complex64(complex64, float32)",
-    "complex128(complex128, float64)",
-]
-_nb_divide_update_seq = vectorize(_divd_sigs)(_nb_divide_update_base)
-_nb_divide_update_par = pvectorize(_divd_sigs)(_nb_divide_update_base)
+@njit(nogil=True)
+def _divide_update_1d_numba(
+    X, c, out, thread_rank=0, num_threads=1, target_block_size=2**14
+):  # pragma: no cover
+    (N,) = X.shape
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            out[i] = X[i] / c
 
 
-def divide_update_(X, c, out):
+def divide_update_(X, c, out, num_threads=None, target_block_size=2**14):
     """Accelerated computation of ``X / c`` into ``out``."""
-    if X.size > 2048:
-        _nb_divide_update_par(X, c, out=out)
+    if X.ndim == 2:
+        fn = _divide_update_2d_numba
     else:
-        _nb_divide_update_seq(X, c, out=out)
+        fn = _divide_update_1d_numba
+
+    maybe_multithread(
+        fn,
+        X,
+        c,
+        out,
+        size_total=X.shape[0],
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
 
 
-@pnjit  # pragma: no cover
-def _dot_csr_matvec_prange(data, indptr, indices, vec, out):
-    for i in numba.prange(vec.size):
-        isum = 0.0
-        for j in range(indptr[i], indptr[i + 1]):
-            isum += data[j] * vec[indices[j]]
-        out[i] = isum
+@njit(nogil=True)  # pragma: no cover
+def _dot_csr_matvec_numba(
+    data,
+    indptr,
+    indices,
+    vec,
+    out,
+    thread_rank=0,
+    num_threads=1,
+    target_block_size=-1024,
+):
+    N = vec.size
+
+    # this thread processes every num_threads'th block: the logic here is you
+    # want to process a large enough block of contiguous rows to make the
+    # memory access efficient, but also cyclically distribute the rows which
+    # may have varying sparsity on a larger scale
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+
+        for i in range(istart, istop):
+            isum = 0.0
+            for j in range(indptr[i], indptr[i + 1]):
+                isum += data[j] * vec[indices[j]]
+            out[i] = isum
 
 
-def par_dot_csr_matvec(A, x):
+def par_dot_csr_matvec(A, x, target_block_size=-1024, num_threads=None):
     """Parallel sparse csr-matrix vector dot product.
 
     Parameters
@@ -595,6 +785,11 @@ def par_dot_csr_matvec(A, x):
         Operator.
     x : dense vector
         Vector.
+    target_block_size : int, optional
+        The target block size (number of rows) for each thread if parallel.
+    num_threads : int, optional
+        Number of threads to use. If None, will use the default number of
+        threads.
 
     Returns
     -------
@@ -607,7 +802,19 @@ def par_dot_csr_matvec(A, x):
     as such this function is only beneficial for pretty large matrices.
     """
     y = np.empty(x.size, common_type(A, x))
-    _dot_csr_matvec_prange(A.data, A.indptr, A.indices, x.ravel(), y)
+
+    maybe_multithread(
+        _dot_csr_matvec_numba,
+        A.data,
+        A.indptr,
+        A.indices,
+        x.ravel(),
+        y,
+        size_total=x.size,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
+
     y.shape = x.shape
     if isinstance(x, qarray):
         y = qarray(y)
@@ -667,23 +874,41 @@ def rdot(a, b):  # pragma: no cover
     return (a @ b).item()
 
 
-@pnjit
-def _l_diag_dot_dense_par(l, A, out):  # pragma: no cover
-    for i in numba.prange(l.size):
-        out[i, :] = l[i] * A[i, :]
+@njit(nogil=True)
+def _l_diag_dot_dense_par(
+    l, A, out, thread_rank=0, num_threads=1, target_block_size=128
+):  # pragma: no cover
+    N, M = A.shape
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            li = l[i]
+            for j in range(M):
+                out[i, j] = li * A[i, j]
 
 
 @ensure_qarray
-def l_diag_dot_dense(diag, mat):
+def l_diag_dot_dense(diag, mat, num_threads=None, target_block_size=128):
     """Dot product of diagonal matrix (with only diagonal supplied) and dense
     matrix.
     """
+    diag = diag.ravel()
+    out = np.empty_like(mat, dtype=common_type(diag, mat))
 
-    if diag.size <= 128:
-        return mul_dense(diag.reshape(-1, 1), mat)
-    else:
-        out = np.empty_like(mat, dtype=common_type(diag, mat))
-        _l_diag_dot_dense_par(diag.ravel(), mat, out)
+    maybe_multithread(
+        _l_diag_dot_dense_par,
+        diag,
+        mat,
+        out,
+        size_total=diag.size,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
 
     return out
 
@@ -716,23 +941,39 @@ def ldmul(diag, mat):
     return l_diag_dot_dense(diag, mat)
 
 
-@pnjit
-def _r_diag_dot_dense_par(A, l, out):  # pragma: no cover
-    for i in numba.prange(l.size):
-        out[:, i] = A[:, i] * l[i]
+@njit(nogil=True)
+def _r_diag_dot_dense_par(
+    A, l, out, thread_rank=0, num_threads=1, target_block_size=128
+):  # pragma: no cover
+    N, M = A.shape
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            for j in range(M):
+                out[i, j] = A[i, j] * l[j]
 
 
 @ensure_qarray
-def r_diag_dot_dense(mat, diag):
+def r_diag_dot_dense(mat, diag, num_threads=None, target_block_size=128):
     """Dot product of dense matrix and digonal matrix (with only diagonal
     supplied).
     """
-    if diag.size <= 128:
-        return mul_dense(mat, diag.reshape(1, -1))
-    else:
-        out = np.empty_like(mat, dtype=common_type(diag, mat))
-        _r_diag_dot_dense_par(mat, diag.ravel(), out)
-
+    diag = diag.ravel()
+    out = np.empty_like(mat, dtype=common_type(diag, mat))
+    maybe_multithread(
+        _r_diag_dot_dense_par,
+        mat,
+        diag,
+        out,
+        size_total=diag.size,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
     return out
 
 
@@ -765,23 +1006,41 @@ def rdmul(mat, diag):
     return r_diag_dot_dense(mat, diag)
 
 
-@pnjit
-def _outer_par(a, b, out, m, n):  # pragma: no cover
-    for i in numba.prange(m):
-        out[i, :] = a[i] * b[:]
+@njit(nogil=True)
+def _outer_par(
+    x, y, out, m, n, thread_rank=0, num_threads=1, target_block_size=128
+):  # pragma: no cover
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        m, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+
+        for i in range(istart, istop):
+            for j in range(n):
+                out[i, j] = x[i] * y[j]
 
 
 @ensure_qarray
-def outer(a, b):
+def outer(a, b, num_threads=None, target_block_size=128):
     """Outer product between two vectors (no conjugation)."""
+    a = a.ravel()
+    b = b.ravel()
     m, n = a.size, b.size
-
-    if m * n < 2**14:
-        return mul_dense(a.reshape(m, 1), b.reshape(1, n))
-
     out = np.empty((m, n), dtype=common_type(a, b))
-    _outer_par(a.ravel(), b.ravel(), out, m, n)
-
+    maybe_multithread(
+        _outer_par,
+        a,
+        b,
+        out,
+        m,
+        n,
+        size_total=m,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
     return out
 
 
@@ -796,36 +1055,55 @@ def explt(l, t):  # pragma: no cover
 # --------------------------------------------------------------------------- #
 
 
-@njit
-def _nb_kron_exp_seq(a, b, out, m, n, p, q):  # pragma: no cover
-    for i in range(m):
-        for j in range(n):
-            ii, fi = i * p, (i + 1) * p
-            ij, fj = j * q, (j + 1) * q
-            out[ii:fi, ij:fj] = a[i, j] * b
-
-
-@pnjit
-def _nb_kron_exp_par(a, b, out, m, n, p, q):  # pragma: no cover
-    for i in numba.prange(m):
-        for j in range(n):
-            ii, fi = i * p, (i + 1) * p
-            ij, fj = j * q, (j + 1) * q
-            out[ii:fi, ij:fj] = a[i, j] * b
+@njit(nogil=True)
+def _kron_dense_numba(
+    x,
+    y,
+    out,
+    m,
+    n,
+    p,
+    q,
+    thread_rank=0,
+    num_threads=1,
+    target_block_size=128,
+):  # pragma: no cover
+    N = m * p
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            ia, ib = divmod(i, p)
+            i = p * ia + ib
+            for ja in range(n):
+                aij = x[ia, ja]
+                for jb in range(q):
+                    j = q * ja + jb
+                    out[i, j] = aij * y[ib, jb]
 
 
 @ensure_qarray
-def kron_dense(a, b, par_thresh=4096):
+def kron_dense(a, b, num_threads=None, target_block_size=128):
     m, n = a.shape
     p, q = b.shape
-
     out = np.empty((m * p, n * q), dtype=common_type(a, b))
-
-    if out.size > 4096:
-        _nb_kron_exp_par(a, b, out, m, n, p, q)
-    else:
-        _nb_kron_exp_seq(a, b, out, m, n, p, q)
-
+    maybe_multithread(
+        _kron_dense_numba,
+        a,
+        b,
+        out,
+        m,
+        n,
+        p,
+        q,
+        size_total=m * p,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
     return out
 
 

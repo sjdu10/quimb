@@ -14,13 +14,12 @@ from autoray import astype, get_dtype_name, to_numpy
 
 from ..core import prod
 from ..utils import (
-    default_to_neutral_style,
     ensure_dict,
     tree_flatten,
     tree_map,
     tree_unflatten,
 )
-from .contraction import contract_backend
+from ..utils_plot import default_to_neutral_style
 from .interface import get_jax
 from .tensor_core import (
     TensorNetwork,
@@ -130,6 +129,18 @@ class Vectorizer:
         for array, info in zip(arrays, self.infos):
             if not isinstance(array, np.ndarray):
                 array = to_numpy(array)
+
+            if array.dtype != info.dtype:
+                warnings.warn(
+                    "dtype mismatch between input parameter and updated "
+                    "values. This can occur e.g. with jax and double "
+                    "precision arrays (in which case consider setting "
+                    '`jax.config.update("jax_enable_x64", True)` at startup '
+                    "or using single precision parameters directly)."
+                    f" For now casting from {array.dtype} to {info.dtype}."
+                )
+                array = array.astype(info.dtype)
+
             # flatten
             if info.iscomplex:
                 # view as real array of double the length
@@ -266,7 +277,6 @@ def _parse_pytree_to_backend(x, to_constant):
 
     def collect(x):
         if hasattr(x, "get_params"):
-
             if hasattr(x, "apply_to_arrays"):
                 x.apply_to_arrays(to_constant)
 
@@ -452,7 +462,7 @@ class AutoGradHandler:
     def __init__(self, device="cpu"):
         if device != "cpu":
             raise ValueError(
-                "`autograd` currently is only " "backed by cpu, numpy arrays."
+                "`autograd` currently is only backed by cpu, numpy arrays."
             )
 
     def to_variable(self, x):
@@ -655,7 +665,7 @@ class TorchHandler:
         def get_gradient_from_torch(t):
             if t.grad is None:
                 return np.zeros(t.shape, dtype=get_dtype_name(t))
-            return to_numpy(t.grad).conj()
+            return to_numpy(t.grad)
 
         result.backward()
         grads = tree_map(get_gradient_from_torch, variables)
@@ -1108,10 +1118,7 @@ class MakeArrayFn:
 
     def __call__(self, arrays):
         tn_compute = inject_variables(arrays, self.tn_opt)
-
-        # set backend explicitly as maybe mixing with numpy arrays
-        with contract_backend(self.autodiff_backend):
-            return self.loss_fn(self.norm_fn(tn_compute))
+        return self.loss_fn(self.norm_fn(tn_compute))
 
 
 def identity_fn(x):
@@ -1409,7 +1416,7 @@ class TNOptimizer:
         """Extract the optimized tensor network, this is a three part process:
 
             1. inject the current optimized vector into the target tensor
-               network,
+               network or pytree,
             2. run it through ``norm_fn``,
             3. drop any tags used to identify variables.
 
@@ -1795,7 +1802,7 @@ class TNOptimizer:
         ax.plot(xs, ys, ".-")
         if xscale == "symlog":
             ax.set_xscale(xscale, linthresh=xscale_linthresh)
-            ax.axvline(xscale_linthresh, color=(.5, .5, .5), ls="-", lw=0.5)
+            ax.axvline(xscale_linthresh, color=(0.5, 0.5, 0.5), ls="-", lw=0.5)
         else:
             ax.set_xscale(xscale)
         ax.set_xlabel("Iteration")

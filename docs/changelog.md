@@ -2,8 +2,52 @@
 
 Release notes for `quimb`.
 
+(whats-new-1-10-1)=
+## v1.10.1 (unreleased)
+
+**Breaking Changes**
+
+- move belief propagation to [`quimb.tensor.belief_propagation`](quimb.tensor.belief_propagation)
+- calling [`tn.contract()`](quimb.tensor.tensor_core.TensorNetwork.contract) when an non-zero value has been accrued into `tn.exponent` now automatically re-absorbs that exponent.
+
+**Enhancements:**
+
+- [`Tensor`](quimb.tensor.tensor_core.Tensor): make binary operations (`+, -, *, /, **`) automatically align and broadcast indices. This would previously error.
+- [`MatrixProductState.measure`](quimb.tensor.tensor_1d.MatrixProductState.measure): add a `seed` kwarg
+- belief propagation, implement DIIS (direct inversion in the iterative subspace)
+- belief propagation, unify various aspects such as message normalization and distance.
+- belief propagation, add a [`plot`](quimb.tensor.belief_propagation.bp_common.BeliefPropagationCommon.plot) method.
+- belief propagation, add a `contract_every` option.
+- HV1BP: vectorize both contraction and message initialization
+- add [`qu.plot_multi_series_zoom`](quimb.utils_plot.plot_multi_series_zoom) for plotting multiple series with a zoomed inset, useful for various convergence plots such as BP
+- add `info` option to [`tn.gauge_all_simple`](quimb.tensor.tensor_core.TensorNetwork.gauge_all_simple) for tracking extra information such as number of iterations and max gauge diffs
+- [`Tensor.gate`](quimb.tensor.tensor_core.Tensor.gate): add `transposed` option
+- [`TensorNetwork.contract`](quimb.tensor.tensor_core.TensorNetwork.contract): add `strip_exponent` option for return the mantissa and exponent (log10) separately. Compatible with [`contract_tags`](quimb.tensor.tensor_core.TensorNetwork.contract_tags), [`contract_cumulative`](quimb.tensor.tensor_core.TensorNetwork.contract_cumulative), [`contract_compressed`](quimb.tensor.tensor_core.TensorNetwork.contract_compressed) sub modes.
+
+**Bug fixes:**
+
+- fix [`MatrixProductState.measure`](quimb.tensor.tensor_1d.MatrixProductState.measure) for `cupy` backend arrays ({issue}`276`).
+
+
+(whats-new-1-10-0)=
+## v1.10.0 (2024-12-18)
+
+**Enhancements:**
+
+- tensor network fitting: add `method="tree"` for when ansatz is a tree - [`tensor_network_fit_tree`](quimb.tensor.fitting.tensor_network_fit_tree)
+- tensor network fitting: fix `method="als"` for complex networks
+- tensor network fitting: allow `method="als"` to use a iterative solver suited to much larger tensors, by default a custom conjugate gradient implementation.
+- [`tensor_network_distance`](quimb.tensor.fitting.tensor_network_distance) and fitting: support hyper indices explicitly via `output_inds` kwarg
+- add [`tn.make_overlap`](quimb.tensor.tensor_core.TensorNetwork.make_overlap) and [`tn.overlap`](quimb.tensor.tensor_core.TensorNetwork.overlap) for computing the overlap between two tensor networks, $\langle O |T \rangle$, with explicit handling of outer indices to address hyper networks. Add `output_inds` to [`tn.norm`](quimb.tensor.tensor_core.TensorNetwork.norm) and [`tn.make_norm`](quimb.tensor.tensor_core.TensorNetwork.make_norm) also, as well as the `squared` kwarg.
+- replace all `numba` based paralellism (`prange` and parallel vectorize) with explicit thread pool based parallelism. Should be more reliable and no need to set `NUMBA_NUM_THREADS` anymore. Remove env var `QUIMB_NUMBA_PAR`.
+- [`Circuit`](quimb.tensor.circuit.Circuit): add `dtype` and `convert_eager` options. `dtype` specifies what the computation should be performed in. `convert_eager` specifies whether to apply this (and any `to_backend` calls) as soon as gates are applied (the default for MPS circuit simulation) or just prior to contraction (the default for exact contraction simulation).
+- [`tn.full_simplify`](quimb.tensor.tensor_core.TensorNetwork.full_simplify): add `check_zero` (by default set of `"auto"`) option which explicitly checks for zero tensor norms when equalizing norms to avoid `log10(norm)` resulting in -inf or nan. Since it creates a data dependency that breaks e.g. `jax` tracing, it is optional.
+- [`schematic.Drawing`](quimb.schematic.Drawing): add `shorten` kwarg to [line drawing](quimb.schematic.Drawing.line) and [curve drawing](quimb.schematic.Drawing.curve) and examples to {ref}`schematic`.
+- [`TensorNetwork`](quimb.tensor.tensor_core.TensorNetwork): add `.backend` and `.dtype_name` properties.
+
+
 (whats-new-1-9-0)=
-## v1.9.0 (unreleased)
+## v1.9.0 (2024-11-19)
 
 **Breaking Changes**
 
@@ -24,8 +68,11 @@ Release notes for `quimb`.
 - specialize [`CircuitMPS.local_expectation`](quimb.tensor.circuit.CircuitMPS.local_expectation) to make use of the MPS form.
 - add [`PEPS.product_state`](quimb.tensor.tensor_2d.PEPS.product_state) for constructing a PEPS representing a product state.
 - add [`PEPS.vacuum`](quimb.tensor.tensor_2d.PEPS.vacuum) for constructing a PEPS representing the vacuum state $|000\ldots0\rangle$.
+- add [`PEPS.zeros`](quimb.tensor.tensor_2d.PEPS.zeros) for constructing a PEPS whose entries are all zero.
 - [`tn.gauge_all_simple`](quimb.tensor.tensor_core.TensorNetwork.gauge_all_simple): improve scheduling and add `damping` and `touched_tids` options.
 - [`qtn.SimpleUpdateGen`](quimb.tensor.tensor_arbgeom_tebd.SimpleUpdateGen): add gauge difference update checking and `tol` and `equilibrate` settings. Update `.plot()` method. Default to a small `cutoff`.
+- add [`psi.sample_configuration_cluster`](quimb.tensor.tensor_arbgeom.TensorNetworkGenVector.sample_configuration_cluster) for sampling a tensor network using the simple update or cluster style environment approximation.
+- add the new doc {ref}`ex-circuit-sampling`
 
 ---
 
@@ -90,7 +137,7 @@ Release notes for `quimb`.
 - add [`TensorNetwork.drape_bond_between`](quimb.tensor.tensor_core.TensorNetwork.drape_bond_between) for 'draping' an existing bond between two tensors through a third
 - add [`Tensor.new_ind_pair_with_identity`](quimb.tensor.tensor_core.Tensor.new_ind_pair_with_identity)
 - TN2D, TN3D and arbitrary geom classical partition function builders ([`TN_classical_partition_function_from_edges`](quimb.tensor.tensor_builder.TN_classical_partition_function_from_edges)) now all support `outputs=` kwarg specifying non-marginalized variables
-- add simple dense 1-norm belief propagation algorithm [`D1BP`](quimb.experimental.belief_propagation.d1bp.D1BP)
+- add simple dense 1-norm belief propagation algorithm [`D1BP`](quimb.tensor.belief_propagation.d1bp.D1BP)
 - add [`qtn.enforce_1d_like`](quimb.tensor.tensor_1d_compress.enforce_1d_like) for checking whether a tensor network is 1D-like, including automatically adding strings of identities between non-local bonds, expanding applicability of [`tensor_network_1d_compress`](quimb.tensor.tensor_1d_compress.tensor_network_1d_compress)
 - add [`MatrixProductState.canonicalize`](quimb.tensor.tensor_1d.MatrixProductState.canonicalize) as (by default *non-inplace*) version of `canonize`, to follow the pattern of other tensor network methods. `canonize` is now an alias for `canonicalize_` [note trailing underscore].
 - add [`MatrixProductState.left_canonicalize`](quimb.tensor.tensor_1d.MatrixProductState.left_canonicalize) as (by default *non-inplace*) version of `left_canonize`, to follow the pattern of other tensor network methods. `left_canonize` is now an alias for `left_canonicalize_` [note trailing underscore].
@@ -301,7 +348,7 @@ Release notes for `quimb`.
   [Tensor.idxmax](quimb.tensor.Tensor.idxmax) for finding the index of the
   minimum/maximum element.
 - 2D and 3D classical partition function TN builders: allow output indices.
-- [`quimb.experimental.belief_propagation`]([`quimb.experimental.belief_propagation`]):
+- [`quimb.tensor.belief_propagation`]([`quimb.tensor.belief_propagation`]):
   add various 1-norm/2-norm dense/lazy BP algorithms.
 
 **Bug fixes:**
