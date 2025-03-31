@@ -916,7 +916,7 @@ def tensor_compress_bond(
     if gauges is not None:
         tn.gauge_simple_remove(outer=outer)
         g = s[0].data
-        fact = g[0]
+        fact = do("linalg.norm", g)
         g = g / fact
         gauges[bix] = g
         fact_1_2 = fact**0.5
@@ -3504,16 +3504,19 @@ def _tensor_network_gate_inds_basic(
     # get the two tensors and their current shared indices etc.
     ixl, ixr = inds
     tl, tr = tn._inds_get(ixl, ixr)
+
+    # TODO: handle possible creation or fusing of bond here?
     bnds_l, (bix,), bnds_r = group_inds(tl, tr)
 
-    # XXX: disable this for symmray, where reduced split is always important
+    # NOTE: disabled for block sparse, where reduced split is always important
     # for keeping charge distributions across tensors stable
-    # if (len(bnds_l) <= 2) or (len(bnds_r) <= 2):
-    #     # reduce split is likely redundant (i.e. contracting pair
-    #     # and splitting just as cheap as performing QR reductions)
-    #     contract = "split"
+    if ((len(bnds_l) <= 2) or (len(bnds_r) <= 2)) and not isblocksparse(G):
+        # reduce split is likely redundant (i.e. contracting pair
+        # and splitting just as cheap as performing QR reductions)
+        contract = "split"
 
     if contract == "split":
+        # contract everything and then split back apart:
         #
         #       │╱  │╱         │╱  │╱
         #     ──GGGGG──  ->  ──G~~~G──
