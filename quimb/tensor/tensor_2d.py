@@ -383,10 +383,10 @@ class TensorNetwork2D(TensorNetworkGen):
 
     This implies the following conventions:
 
-        * the 'up' bond is coordinates ``(i, j), (i + 1, j)``
-        * the 'down' bond is coordinates ``(i, j), (i - 1, j)``
-        * the 'right' bond is coordinates ``(i, j), (i, j + 1)``
-        * the 'left' bond is coordinates ``(i, j), (i, j - 1)``
+        * the 'up' (x+) bond is coordinates ``(i, j), (i + 1, j)``
+        * the 'down' (x-) bond is coordinates ``(i, j), (i - 1, j)``
+        * the 'right' (y+) bond is coordinates ``(i, j), (i, j + 1)``
+        * the 'left' (y-) bond is coordinates ``(i, j), (i, j - 1)``
 
     """
 
@@ -1264,10 +1264,8 @@ class TensorNetwork2D(TensorNetworkGen):
         istep = r2d.istep
 
         def _do_compress(site_tag_tmps):
-            nonlocal self
-
             # split off the boundary network
-            self, tn_boundary = self.partition(site_tag_tmps, inplace=True)
+            tn_boundary = self.partition(site_tag_tmps, inplace=True)[1]
 
             # compress it inplace
             tensor_network_1d_compress(
@@ -1281,7 +1279,7 @@ class TensorNetwork2D(TensorNetworkGen):
             )
 
             # recombine with the main network
-            self |= tn_boundary
+            self.add_tensor_network(tn_boundary, virtual=True)
 
         # maybe compress the initial row, which may be multiple layers
         # and have effective bond dimension > max_bond already
@@ -1294,6 +1292,10 @@ class TensorNetwork2D(TensorNetworkGen):
         if layer_tags is None:
             layer_tags = [None]
 
+        # we explicitly track the temporary tags to drop later, so we don't
+        # have to track all the env networks they might appear in
+        record = {}
+
         for i in r2d.sweep[:-1]:
             for layer_tag in layer_tags:
                 for j, st in zip(r2d.sweep_other, site_tag_tmps):
@@ -1302,15 +1304,26 @@ class TensorNetwork2D(TensorNetworkGen):
                     tag2 = site_tag(i + istep, j)  # inner
                     if layer_tag is None:
                         # tag and compress any inner tensors
-                        self.select_any((tag1, tag2)).add_tag(st)
+                        self.add_tag(
+                            st, where=(tag1, tag2), which="any", record=record
+                        )
                     else:
                         # only tag and compress one inner layer
-                        self.select_all((tag1,)).add_tag(st)
-                        self.select_all((tag2, layer_tag)).add_tag(st)
+                        self.add_tag(st, where=(tag1,), record=record)
+                        self.add_tag(
+                            st,
+                            where=(tag2, layer_tag),
+                            which="all",
+                            record=record,
+                        )
 
                 _do_compress(site_tag_tmps)
 
+        # rewind *all* the temporary tags
         self.drop_tags(site_tag_tmps)
+        # even those not in final boundary
+        for t, t_tmp_tags in record.items():
+            t.drop_tags(t_tmp_tags)
 
     def _contract_boundary_core(
         self,
@@ -2476,7 +2489,11 @@ class TensorNetwork2D(TensorNetworkGen):
         inplace=False,
         **contract_boundary_opts,
     ):
-        """Contract the boundary of this 2D tensor network inwards::
+        r"""Contract the boundary of this 2D tensor network inwards. By
+        default, if contracting to a scalar, this contracts the two shortest
+        opposing sides inwards. If `around` is specified, or depending on
+        `sequence`, it can contract from in any sequence of directions, and in
+        any order like so::
 
             ●──●──●──●       ●──●──●──●       ●──●──●
             │  │  │  │       │  │  │  │       ║  │  │
@@ -2669,6 +2686,7 @@ class TensorNetwork2D(TensorNetworkGen):
         dense=False,
         compress_opts=None,
         envs=None,
+        equalize_norms=False,
         **contract_boundary_opts,
     ):
         """Compute the 1D boundary tensor networks describing the environments
@@ -2702,6 +2720,10 @@ class TensorNetwork2D(TensorNetworkGen):
             :func:`~quimb.tensor.tensor_core.tensor_compress_bond`.
         envs : dict, optional
             An existing dictionary to store the environments in.
+        equalize_norms : bool or float, optional
+            Whether to equalize the norms of the boundary tensors after each
+            contraction, gathering the overall scaling coefficient, log10, in
+            ``tn.exponent``.
         contract_boundary_opts
             Other options to pass to
             :meth:`~quimb.tensor.tensor_2d.TensorNetwork2D.contract_boundary_from`.
@@ -2735,6 +2757,10 @@ class TensorNetwork2D(TensorNetworkGen):
             iprev = i - sweep.step
             if dense:
                 tn ^= (x_tag(iprevprev), x_tag(iprev))
+
+                if equalize_norms:
+                    tn.equalize_norms_(equalize_norms)
+
             else:
                 tn.contract_boundary_from_(
                     xrange=(
@@ -2750,6 +2776,7 @@ class TensorNetwork2D(TensorNetworkGen):
                     canonize=canonize,
                     layer_tags=layer_tags,
                     compress_opts=compress_opts,
+                    equalize_norms=equalize_norms,
                     **contract_boundary_opts,
                 )
 
@@ -4388,7 +4415,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             equalize_norms=equalize_norms,
             progbar=progbar,
             inplace=True,
-            **contract_opts
+            **contract_opts,
         )
 
     def compute_local_expectation(
@@ -4803,10 +4830,10 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
     arrays : sequence of sequence of array_like
         The core tensor data arrays.
     shape : str, optional
-        Which order the dimensions of the arrays are stored in, the default
+        Which order the dimensions of the arrays are supplied in, the default
         ``'urdlp'`` stands for ('up', 'right', 'down', 'left', 'physical').
         Arrays on the edge of lattice are assumed to be missing the
-        corresponding dimension.
+        corresponding dimension. Internally, the arrays are stored 'urdlp'.
     tags : set[str], optional
         Extra global tags to add to the tensor network.
     site_ind_id : str, optional
@@ -4954,7 +4981,7 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
             Whether the lattice is cyclic in the x and y directions.
         shape : str, optional
             How to layout the indices of the tensors, the default is
-            ``(up, right, down, left, phys) == 'urdlbk'``. This is the order
+            ``(up, right, down, left, phys) == 'urdlp'``. This is the order
             of the shape supplied to the filling function.
         peps_opts
             Supplied to :class:`~quimb.tensor.tensor_2d.PEPS`.
@@ -5262,8 +5289,9 @@ class PEPO(TensorNetwork2DOperator, TensorNetwork2DFlat):
     arrays : sequence of sequence of array
         The core tensor data arrays.
     shape : str, optional
-        Which order the dimensions of the arrays are stored in, the default
-        ``'urdlbk'`` stands for ('up', 'right', 'down', 'left', 'bra', 'ket').
+        What order the dimensions of the arrays are supplied in, the default
+        ``'urdlbk'`` stands for ('up' / x+, 'right' / y+, 'down' / x-,
+        'left' / y-, 'bra', 'ket').
         Arrays on the edge of lattice are assumed to be missing the
         corresponding dimension.
     tags : set[str], optional

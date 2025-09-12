@@ -223,6 +223,17 @@ class TestCircuit:
             "U3",
         ] * 4
 
+    def test_openqasm2_a_gate_called_gate(self):
+        qasm_str = """
+        OPENQASM 2.0;
+        include "qelib1.inc";
+        gate gate_PauliEvolution(param0) q0,q1 { rz(0.2) q0; rz(-0.1) q1; }
+        qreg q[2];
+        gate_PauliEvolution(0.1) q[0],q[1];
+        """
+        circ = qtn.Circuit.from_openqasm2_str(qasm_str)
+        assert len(circ.gates) == 2
+
     @pytest.mark.parametrize(
         "Circ", [qtn.Circuit, qtn.CircuitMPS, qtn.CircuitDense]
     )
@@ -460,13 +471,15 @@ class TestCircuit:
 
         C = 2**10
         L = 5
-        circ = random_a2a_circ(L, 3)
+        circ = random_a2a_circ(L, 3, seed=42)
 
         psi = circ.to_dense()
         p_exp = abs(psi.reshape(-1)) ** 2
         f_exp = p_exp * C
 
-        counts = collections.Counter(circ.sample(C, group_size=group_size))
+        counts = collections.Counter(
+            circ.sample(C, group_size=group_size, seed=42)
+        )
         f_obs = np.zeros(2**L)
         for b, c in counts.items():
             f_obs[int(b, 2)] = c
@@ -481,14 +494,14 @@ class TestCircuit:
 
         C = 2**10
         L = 5
-        circ = random_a2a_circ(L, 3)
+        circ = random_a2a_circ(L, 3, seed=43)
 
         psi = circ.to_dense()
         p_exp = abs(psi.reshape(-1)) ** 2
         f_exp = p_exp * C
 
         counts = collections.Counter(
-            circ.sample_gate_by_gate(C, group_size=group_size)
+            circ.sample_gate_by_gate(C, group_size=group_size, seed=42)
         )
         f_obs = np.zeros(2**L)
         for b, c in counts.items():
@@ -507,8 +520,8 @@ class TestCircuit:
         depth = 2
         goodnesses = [0] * 5
 
-        for _ in range(reps):
-            circ = random_a2a_circ(L, depth)
+        for i in range(reps):
+            circ = random_a2a_circ(L, depth, seed=42 + i)
 
             psi = circ.to_dense()
             p_exp = abs(psi.reshape(-1)) ** 2
@@ -516,7 +529,7 @@ class TestCircuit:
 
             for num_marginal in [3, 4, 5]:
                 counts = collections.Counter(
-                    circ.sample_chaotic(C, num_marginal, seed=666)
+                    circ.sample_chaotic(C, num_marginal, seed=42 + i)
                 )
                 f_obs = np.zeros(2**L)
                 for b, c in counts.items():
@@ -665,7 +678,7 @@ class TestCircuit:
             circ.apply_gate("CNOT", regs[i], regs[i + 1])
         circ.apply_gate("X", N - 1, controls=range(N - 1))
         circ.apply_gate("SWAP", qubits=(N - 2, N - 1), controls=range(N - 2))
-        (b,) = circ.sample(1, group_size=3)
+        (b,) = circ.sample(1, group_size=3, seed=42)
         assert b[N - 2] == "0"
 
     @pytest.mark.parametrize("dtype", [None, "complex64", "complex128"])
@@ -784,7 +797,7 @@ class TestCircuitMPS:
         circ.cx(0, 5)
         circ.cx(5, 4)
         circ.x(4)
-        for x in circ.sample(10):
+        for x in circ.sample(10, seed=42):
             assert x in {"000010", "111101"}
 
     def test_mps_sampling_seed(self):
@@ -805,7 +818,7 @@ class TestCircuitMPS:
         circ.cx(5, 4)
         circ.x(4)
         assert circ.qubits != tuple(range(N))
-        for x in circ.sample(10):
+        for x in circ.sample(10, seed=42):
             assert x in {"000010", "111101"}
 
     def test_permmps_sampling_seed(self):

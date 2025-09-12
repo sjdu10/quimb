@@ -26,7 +26,6 @@ from ..gen.rand import (
 from ..utils import concat, deprecated, unique
 from .array_ops import asarray, do, reshape, sensibly_scale
 from .contraction import array_contract
-from .decomp import eigh_truncated
 from .tensor_1d import MatrixProductOperator, MatrixProductState
 from .tensor_1d_tebd import LocalHam1D
 from .tensor_2d import TensorNetwork2D, gen_2d_bonds, gen_2d_plaquettes
@@ -2048,14 +2047,16 @@ def classical_ising_sqrtS_matrix(beta, j=1.0, asymm=None):
     network.
     """
     if (j < 0.0) and (asymm is not None):
-        Slr = eigh_truncated(classical_ising_S_matrix(beta=beta, j=j))
-        S_1_2 = {
-            "l": Slr[0],
-            "lT": Slr[0].T,
-            "r": Slr[-1],
-            "rT": Slr[-1].T,
-        }[asymm]
+        if asymm == "l":
+            S_1_2 = classical_ising_S_matrix(beta=beta, j=j)
+        elif asymm == "r":
+            S_1_2 = eye(2, dtype=float)
+        else:
+            raise ValueError(
+                f"Invalid asymm value '{asymm}', must be 'l' or 'r'."
+            )
     else:
+        # make it symmetric explicitly
         S_1_2 = (
             np.array(
                 [
@@ -2409,7 +2410,7 @@ def TN2D_classical_ising_partition_function(
                 # this is logic for handling negative j without imag tensors
                 # i.e. add the left factor if the first instance of bond, right
                 # factor if second. If j > 0.0 this doesn't matter anyhow
-                asymms += ("l" if pair not in bonds else "rT",)
+                asymms += ("l" if pair not in bonds else "r",)
                 inds.append(bonds[pair])
 
         site_is_output = (ni, nj) in outputs
@@ -2555,7 +2556,7 @@ def TN3D_classical_ising_partition_function(
                 # this is logic for handling negative j without imag tensors
                 # i.e. add the left factor if the first instance of bond, right
                 # factor if second. If j > 0.0 this doesn't matter anyhow
-                asymms += ("l" if pair not in bonds else "rT",)
+                asymms += ("l" if pair not in bonds else "r",)
                 inds.append(bonds[pair])
 
         site_is_output = (ni, nj, nk) in outputs
@@ -3756,17 +3757,27 @@ def MPS_product_state(arrays, cyclic=False, **mps_opts):
     """Generate a product state in MatrixProductState form, i,e,
     with bond dimension 1, from single site vectors described by ``arrays``.
     """
-    cyc_dim = (1,) if cyclic else ()
+    arrays = tuple(arrays)
+    L = len(arrays)
 
-    def gen_array_shapes():
-        yield (*cyc_dim, 1, -1)
-        for _ in range(len(arrays) - 2):
-            yield (1, 1, -1)
-        yield (*cyc_dim, 1, -1)
+    if L == 1:
+        if cyclic:
+            shapes = [(1, 1, -1)]
+        else:
+            shapes = [(-1,)]
+    else:
+        shapes = []
+        for i in range(L):
+            shape = []
+            if (i > 0) or cyclic:
+                shape.append(1)
+            if (i < L - 1) or cyclic:
+                shape.append(1)
+            shape.append(-1)
+            shapes.append(tuple(shape))
 
     mps_arrays = (
-        asarray(array).reshape(*shape)
-        for array, shape in zip(arrays, gen_array_shapes())
+        asarray(array).reshape(*shape) for array, shape in zip(arrays, shapes)
     )
 
     return MatrixProductState(mps_arrays, shape="lrp", **mps_opts)
@@ -3843,10 +3854,14 @@ def MPS_COPY(
     """
 
     def gen_arrays():
-        yield delta_array((phys_dim,) * 2, dtype=dtype)
-        for i in range(1, L - 1):
-            yield delta_array((phys_dim,) * 3, dtype=dtype)
-        yield delta_array((phys_dim,) * 2, dtype=dtype)
+        for i in range(L):
+            shape = []
+            if i > 0:
+                shape.append(phys_dim)
+            if i < L - 1:
+                shape.append(phys_dim)
+            shape.append(phys_dim)
+            yield delta_array(tuple(shape), dtype=dtype)
 
     return MatrixProductState(gen_arrays(), **mps_opts)
 
@@ -4098,16 +4113,28 @@ def MPO_product_operator(
     -------
     MatrixProductOperator
     """
-    cyc_dim = (1,) if cyclic else ()
+    arrays = tuple(arrays)
+    L = len(arrays)
 
-    def gen_arrays():
-        array_i, *arrays_mid, array_f = arrays
-        yield reshape(array_i, (*cyc_dim, 1, *array_i.shape))
-        for array_m in arrays_mid:
-            yield reshape(array_m, (1, 1, *array_m.shape))
-        yield reshape(array_f, (*cyc_dim, 1, *array_f.shape))
+    if L == 1:
+        array0 = arrays[0]
+        if cyclic:
+            shape0 = ar.do("shape", array0)
+            reshaped_arrays = [reshape(array0, (1, 1, *shape0))]
+        else:
+            reshaped_arrays = [array0]
+    else:
+        reshaped_arrays = []
+        for i, array in enumerate(arrays):
+            shape = []
+            if (i > 0) or cyclic:
+                shape.append(1)
+            if (i < L - 1) or cyclic:
+                shape.append(1)
+            shape.extend(ar.do("shape", array))
+            reshaped_arrays.append(reshape(array, tuple(shape)))
 
-    return MatrixProductOperator(gen_arrays(), shape="lrud", **mpo_opts)
+    return MatrixProductOperator(reshaped_arrays, shape="lrud", **mpo_opts)
 
 
 @random_seed_fn

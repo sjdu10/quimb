@@ -5,7 +5,7 @@ import itertools
 import numpy as np
 from autoray import do
 
-from ..utils import ensure_dict, continuous_progbar, deprecated
+from ..utils import continuous_progbar, deprecated, ensure_dict
 from ..utils import progbar as Progbar
 from .array_ops import norm_fro
 from .tensor_arbgeom_tebd import LocalHamGen
@@ -146,8 +146,8 @@ class LocalHam1D(LocalHamGen):
         split_opts
             Supplied to :func:`~quimb.tensor.tensor_core.tensor_split`.
         """
-        from .tensor_core import Tensor
         from .tensor_1d import MatrixProductOperator
+        from .tensor_core import Tensor
 
         mpo = MatrixProductOperator.new(
             L=self.L,
@@ -225,14 +225,14 @@ class TEBD:
     p0 : MatrixProductState
         Initial state.
     H : LocalHam1D or array_like
-        Dense hamiltonian representing the two body interaction. Should have
-        shape ``(d * d, d * d)``, where ``d`` is the physical dimension of
-        ``p0``.
+        Local terms or single dense hamiltonian representing the two body
+        interaction. If so should have shape ``(d * d, d * d)``, where ``d``
+        is the physical dimension of ``p0``.
     dt : float, optional
         Default time step, cannot be set as well as ``tol``.
     tol : float, optional
         Default target error for each evolution, cannot be set as well as
-        ``dt``, which will instead be calculated from the trotter orderm length
+        ``dt``, which will instead be calculated from the trotter order, length
         of time, and hamiltonian norm.
     t0 : float, optional
         Initial time. Defaults to 0.0.
@@ -240,7 +240,7 @@ class TEBD:
         Compression options applied for splitting after gate application, see
         :func:`~quimb.tensor.tensor_core.tensor_split`.
     imag : bool, optional
-        Enable imaginary time evolution. Defaults to false.
+        Enable imaginary time evolution. Defaults to ``False``.
 
     See Also
     --------
@@ -274,7 +274,7 @@ class TEBD:
 
         if p0.cyclic != H.cyclic:
             raise ValueError(
-                "Both ``p0`` and ``H`` should have matching OBC " "or PBC."
+                "Both ``p0`` and ``H`` should have matching OBC or PBC."
             )
 
         self.H = H

@@ -455,6 +455,27 @@ class TestTensorFunctions:
             )
         assert (a_split ^ ...).almost_equals(a)
 
+    @pytest.mark.parametrize("matrix_svals", [False, True])
+    def test_split_tensor_return_svals(self, matrix_svals):
+        t = rand_tensor((2, 3, 4, 5), inds=("a", "b", "c", "d"))
+
+        _, svals, _ = t.split(
+            ["a", "d"], get="arrays", absorb=None, matrix_svals=matrix_svals
+        )
+        if matrix_svals:
+            assert svals.shape == (10, 10)
+        else:
+            assert svals.shape == (10,)
+
+        tn = t.split(["a", "d"], absorb=None, matrix_svals=matrix_svals)
+        assert tn.num_tensors == 3
+        if matrix_svals:
+            assert not tn.get_hyperinds()
+        else:
+            assert tn.get_hyperinds()
+        tc = tn.contract(output_inds=t.inds)
+        assert_allclose(tc.data, t.data)
+
     @pytest.mark.parametrize("method", ["svd", "eig"])
     def test_singular_values(self, method):
         psim = Tensor(np.eye(2) * 2**-0.5, inds="ab")
@@ -706,6 +727,27 @@ class TestTensorFunctions:
         t.new_ind_with_identity("switch", ["a", "c"], ["b", "d"], axis=2)
         assert t.inds == ("a", "b", "switch", "c", "d")
         assert t.isel({"switch": 1}).data.sum() == pytest.approx(6)
+
+    def test_new_ind_pair_diag(self):
+        data = np.array([1, 2, 3])
+        inds = ["a"]
+        t = Tensor(data=data, inds=inds)
+        new_left_ind = "b"
+        new_right_ind = "c"
+        expanded_tensor = t.new_ind_pair_diag(
+            "a", new_left_ind, new_right_ind, inplace=False
+        )
+        assert t.inds == ("a",)
+        assert_allclose(t.data, data)
+        assert expanded_tensor.inds == ("b", "c")
+        assert expanded_tensor.shape == (3, 3)
+        expected_data = np.zeros((3, 3))
+        np.fill_diagonal(expected_data, data)
+        assert_allclose(expanded_tensor.data, expected_data)
+        t.new_ind_pair_diag_("a", new_left_ind, new_right_ind)
+        assert t.inds == ("b", "c")
+        assert t.shape == (3, 3)
+        assert_allclose(t.data, expected_data)
 
     def test_idxmin(self):
         data = np.arange(24).reshape(2, 3, 4)
@@ -1608,7 +1650,8 @@ class TestTensorNetwork:
             assert psi.H @ psi == pytest.approx(x_exp, rel=1e-4)
         else:
             assert all(n1 == pytest.approx(value) for n1 in enorms)
-            assert (psi.H @ psi) == pytest.approx(x_exp)
+            rel = 1e-5 if dtype == "float32" else None
+            assert (psi.H @ psi) == pytest.approx(x_exp, rel=rel)
 
     @pytest.mark.parametrize("append", [None, "*"])
     def test_mangle_inner(self, append):
@@ -1824,6 +1867,55 @@ class TestTensorNetwork:
         rx = ramp.contract()
         xs = mps.to_dense().ravel()
         assert not any(np.allclose(rx, x) for x in xs)
+
+    def test_insert_compressor_between_regions(self):
+        inputs = ["abgl", "gfhim", "bcdfe", "iekj"]
+        tags = ["A", "C", "B", "D"]
+        size_dict = {ix: 2 for ix in set("".join(inputs))}
+        ts = [
+            qtn.rand_tensor(
+                [size_dict[k] for k in term], inds=term, tags=[tag]
+            )
+            for term, tag in zip(inputs, tags)
+        ]
+        tn = qtn.TensorNetwork(ts)
+        gh = tn.geometry_hash()
+
+        # compute the svd via explicit contraction of the whole tensor
+        td = tn.contract()
+        tn_ex = td.split(["a", "l", "c", "d"], max_bond=4)
+        d1 = tn_ex.distance(tn)
+
+        # test inserting into parallel network
+        tn_other = tn.copy()
+        tn.insert_compressor_between_regions_(
+            ["A", "B"], ["C", "D"], max_bond=4, insert_into=tn_other
+        )
+        assert tn.geometry_hash() == gh
+        assert tn_other.num_tensors == 6
+        d = tn_other.distance(tn)
+        assert d == pytest.approx(d1)
+
+        # test not-inplace
+        tn_other = tn.insert_compressor_between_regions(
+            ["A", "B"],
+            ["C", "D"],
+            max_bond=4,
+        )
+        assert tn.geometry_hash() == gh
+        assert tn_other.num_tensors == 6
+        d = tn_other.distance(tn)
+        assert d == pytest.approx(d1)
+
+        # test inplace
+        tn_other = tn.copy()
+        tn_other.insert_compressor_between_regions_(
+            ["A", "B"], ["C", "D"], max_bond=4
+        )
+        assert tn_other.geometry_hash() != gh
+        assert tn_other.num_tensors == 6
+        d = tn_other.distance(tn)
+        assert d == pytest.approx(d1)
 
 
 class TestTensorNetworkSimplifications:

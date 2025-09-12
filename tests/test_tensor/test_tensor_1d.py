@@ -10,12 +10,12 @@ dtypes = ["float32", "float64", "complex64", "complex128"]
 
 class TestMatrixProductState:
     def test_matrix_product_state(self):
-        tensors = (
+        arrays = (
             [np.random.rand(5, 2)]
             + [np.random.rand(5, 5, 2) for _ in range(3)]
             + [np.random.rand(5, 2)]
         )
-        mps = qtn.MatrixProductState(tensors)
+        mps = qtn.MatrixProductState(arrays)
         mps.check()
         assert len(mps.tensors) == 5
         nmps = mps.reindex_sites("foo{}", inplace=False, where=slice(0, 3))
@@ -787,6 +787,23 @@ class TestMatrixProductState:
         xb = psi.compute_local_expectation(terms, method="envs")
         assert xb == pytest.approx(ex)
 
+    def test_single_site_constructor(self):
+        arrays = [np.random.randn(2)]
+        mps = qtn.MatrixProductState(arrays)
+        mps.check()
+        assert mps.L == 1
+        assert mps.num_tensors == 1
+        assert mps.num_indices == 1
+        assert not mps.cyclic
+
+        arrays = [np.random.randn(3, 3, 2)]
+        mps = qtn.MatrixProductState(arrays)
+        mps.check()
+        assert mps.L == 1
+        assert mps.num_tensors == 1
+        assert mps.num_indices == 2
+        assert mps.cyclic
+
 
 class TestMatrixProductOperator:
     @pytest.mark.parametrize("cyclic", [False, True])
@@ -1022,6 +1039,23 @@ class TestMatrixProductOperator:
             Ak,
         )
 
+    def test_single_site_constructor(self):
+        arrays = [np.random.randn(2, 2)]
+        mpo = qtn.MatrixProductOperator(arrays)
+        mpo.check()
+        assert mpo.L == 1
+        assert mpo.num_tensors == 1
+        assert mpo.num_indices == 2
+        assert not mpo.cyclic
+
+        arrays = [np.random.randn(3, 3, 2, 2)]
+        mpo = qtn.MatrixProductOperator(arrays)
+        mpo.check()
+        assert mpo.L == 1
+        assert mpo.num_tensors == 1
+        assert mpo.num_indices == 3
+        assert mpo.cyclic
+
 
 # --------------------------------------------------------------------------- #
 #                         Test specific 1D instances                          #
@@ -1126,7 +1160,13 @@ class TestDense1D:
 
 class TestTensor1DCompress:
     @pytest.mark.parametrize(
-        "method", ["direct", "dm", "fit", "zipup", "zipup-first"]
+        "method", [
+            "direct",
+            "dm",
+            "fit",
+            "zipup",
+            "zipup-first",
+        ]
     )
     @pytest.mark.parametrize("dtype", dtypes)
     def test_mps_partial_mpo_apply(self, method, dtype):
@@ -1145,13 +1185,21 @@ class TestTensor1DCompress:
         )
 
     @pytest.mark.parametrize(
-        "method", ["direct", "dm", "fit", "zipup", "zipup-first"]
+        "method", [
+            "direct",
+            "dm",
+            "fit",
+            "zipup",
+            "zipup-first",
+            "src",
+            "src-first",
+        ]
     )
     @pytest.mark.parametrize("sweep_reverse", [False, True])
     def test_mpo_compress_opts(self, method, sweep_reverse):
         L = 6
-        A = qtn.MPO_rand(L, 2, phys_dim=3)
-        B = qtn.MPO_rand(L, 3, phys_dim=3)
+        A = qtn.MPO_rand(L, 2, phys_dim=3, tags="A")
+        B = qtn.MPO_rand(L, 3, phys_dim=3, tags="B")
         AB = A.gate_upper_with_op_lazy(B)
         assert AB.num_tensors == 2 * L
         ABc = qtn.tensor_network_1d_compress(
@@ -1169,3 +1217,6 @@ class TestTensor1DCompress:
             assert ABc.calc_current_orthog_center() == (L - 1, L - 1)
         else:
             assert ABc.calc_current_orthog_center() == (0, 0)
+
+        for site in range(L):
+            assert set(ABc[site].tags) == {"A", "B", f"I{site}"}

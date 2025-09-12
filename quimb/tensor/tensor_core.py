@@ -89,14 +89,15 @@ from .networking import (
     compute_hierarchical_ssa_path,
     compute_shortest_distances,
     gen_all_paths_between_tids,
+    gen_gloops,
     gen_inds_connected,
     gen_loops,
     gen_patches,
     gen_paths_loops,
-    gen_gloops,
+    gen_sloops,
     get_local_patch,
-    get_path_between_tids,
     get_loop_union,
+    get_path_between_tids,
     get_tree_span,
     isconnected,
     istree,
@@ -405,9 +406,13 @@ _DENSE_ONLY_METHODS = {
     "lu",
     "svdamr",
 }
+# methods whose left factor is isometric
 _LEFT_ISOM_METHODS = {"qr", "polar_right"}
+# methods whose right factor is isometric
 _RIGHT_ISOM_METHODS = {"lq", "polar_left"}
-_ISOM_METHODS = {"svd", "eig", "eigh", "isvd", "svds", "rsvd", "eigsh"}
+# methods whose left and right factors are isometric, depending
+# on where the 'singular/eigen' values are absorbed
+_BOTH_ISOM_METHODS = {"svd", "eig", "eigh", "isvd", "svds", "rsvd", "eigsh"}
 
 _CUTOFF_LOOKUP = {None: -1.0}
 _ABSORB_LOOKUP = {"left": -1, "both": 0, "right": 1, None: None}
@@ -455,10 +460,10 @@ def _parse_split_opts(method, cutoff, absorb, max_bond, cutoff_mode, renorm):
 @functools.lru_cache(None)
 def _check_left_right_isom(method, absorb):
     left_isom = (method in _LEFT_ISOM_METHODS) or (
-        method in _ISOM_METHODS and absorb in (None, "right")
+        method in _BOTH_ISOM_METHODS and absorb in (None, "right")
     )
-    right_isom = (method == _RIGHT_ISOM_METHODS) or (
-        method in _ISOM_METHODS and absorb in (None, "left")
+    right_isom = (method in _RIGHT_ISOM_METHODS) or (
+        method in _BOTH_ISOM_METHODS and absorb in (None, "left")
     )
     return left_isom, right_isom
 
@@ -479,6 +484,8 @@ def tensor_split(
     stags=None,
     bond_ind=None,
     right_inds=None,
+    matrix_svals=False,
+    **kwargs,
 ):
     """Decompose this tensor into two tensors.
 
@@ -559,9 +566,15 @@ def tensor_split(
         Add these new tags to the singular value tensor.
     bond_ind : str, optional
         Explicitly name the new bond, else a random one will be generated.
+        If ``matrix_svals=True`` then this should be a tuple of two indices,
+        one for the left and right bond respectively.
     right_inds : sequence of str, optional
         Explicitly give the right indices, otherwise they will be worked out.
         This is a minor performance feature.
+    matrix_svals : bool, optional
+        If ``True``, return the singular values as a diagonal 2D array or
+        Tensor, otherwise return them as a 1D array. This is only relevant if
+        returning the singular value in some form.
 
     Returns
     -------
@@ -608,14 +621,17 @@ def tensor_split(
             array = TT.data
 
     if get == "values":
-        return _SPLIT_VALUES_FNS[method](array)
+        s = _SPLIT_VALUES_FNS[method](array)
+        if matrix_svals:
+            s = do("diag", s)
+        return s
 
     opts = _parse_split_opts(
         method, cutoff, absorb, max_bond, cutoff_mode, renorm
     )
 
     # `s` itself will be None unless `absorb=None` is specified
-    left, s, right = _SPLIT_FNS[method](array, **opts)
+    left, s, right = _SPLIT_FNS[method](array, **opts, **kwargs)
 
     if nleft != 1:
         # unfuse dangling left indices
@@ -626,19 +642,37 @@ def tensor_split(
 
     if get == "arrays":
         if absorb is None:
+            if matrix_svals:
+                s = do("diag", s)
             return left, s, right
         return left, right
 
-    bond_ind = rand_uuid() if bond_ind is None else bond_ind
+    if matrix_svals:
+        if bond_ind is None:
+            bond_ind_l = rand_uuid()
+            bond_ind_r = rand_uuid()
+        else:
+            bond_ind_l, bond_ind_r = bond_ind
+    else:
+        if bond_ind is None:
+            bond_ind = rand_uuid()
+        bond_ind_l = bond_ind_r = bond_ind
+
     ltags = T.tags | tags_to_oset(ltags)
     rtags = T.tags | tags_to_oset(rtags)
 
-    Tl = Tensor(data=left, inds=(*left_inds, bond_ind), tags=ltags)
-    Tr = Tensor(data=right, inds=(bond_ind, *right_inds), tags=rtags)
+    Tl = Tensor(data=left, inds=(*left_inds, bond_ind_l), tags=ltags)
+    Tr = Tensor(data=right, inds=(bond_ind_r, *right_inds), tags=rtags)
 
     if absorb is None:
+        # need to also wrap the singular values as a tensor
         stags = T.tags | tags_to_oset(stags)
-        Ts = Tensor(data=s, inds=(bond_ind,), tags=stags)
+        if matrix_svals:
+            s = do("diag", s)
+            Ts = Tensor(data=s, inds=(bond_ind_l, bond_ind_r), tags=stags)
+        else:
+            Ts = Tensor(data=s, inds=(bond_ind,), tags=stags)
+
         tensors = (Tl, Ts, Tr)
     else:
         tensors = (Tl, Tr)
@@ -663,6 +697,7 @@ def tensor_canonize_bond(
     absorb="right",
     gauges=None,
     gauge_smudge=1e-6,
+    create_bond=False,
     **split_opts,
 ):
     r"""Inplace 'canonization' of two tensors. This gauges the bond between
@@ -682,6 +717,14 @@ def tensor_canonize_bond(
         The tensor to absorb the R-factor into.
     absorb : {'right', 'left', 'both', None}, optional
         Which tensor to effectively absorb the singular values into.
+    gauges : None or dict, optional
+        If supplied, a dict of bond gauges to perform the canonization with
+        respect to.
+    gauge_smudge : float, optional
+        If gauges are supplied, the smudge to use when gauging.
+    create_bond : bool, optional
+        If ``True``, and there is no bond between the two tensors, create a
+        new bond with size 1 before canonizing. Else raise an error.
     split_opts
         Supplied to :func:`~quimb.tensor.tensor_core.tensor_split`, with
         modified defaults of ``method=='qr'`` and ``absorb='right'``.
@@ -692,16 +735,26 @@ def tensor_canonize_bond(
         # same as doing reduced compression with no truncation
         split_opts.setdefault("cutoff", 0.0)
         return tensor_compress_bond(
-            T1, T2, gauges=gauges, gauge_smudge=gauge_smudge, **split_opts
+            T1,
+            T2,
+            gauges=gauges,
+            gauge_smudge=gauge_smudge,
+            create_bond=create_bond,
+            **split_opts,
         )
 
     split_opts.setdefault("method", "qr")
     if absorb == "left":
         T1, T2 = T2, T1
 
-    lix, bix, _ = tensor_make_single_bond(T1, T2, gauges=gauges)
+    lix, bix, _ = tensor_make_single_bond(
+        T1, T2, gauges=gauges, create_bond=create_bond
+    )
     if not bix:
-        raise ValueError("The tensors specified don't share an bond.")
+        raise ValueError(
+            "The tensors specified don't share an bond. "
+            "To create one automatically, set `create_bond=True`."
+        )
 
     if (T1.left_inds is not None) and set(T1.left_inds) == set(lix):
         # tensor is already isometric with respect to shared bonds
@@ -772,6 +825,7 @@ def tensor_compress_bond(
     absorb="both",
     gauges=None,
     gauge_smudge=1e-6,
+    create_bond=False,
     info=None,
     **compress_opts,
 ):
@@ -808,14 +862,27 @@ def tensor_compress_bond(
         i.e. the pair are right or left canonical respectively.
     absorb : {'both', 'left', 'right', None}, optional
         Where to absorb the singular values after decomposition.
+    gauges : None or dict, optional
+        If supplied, a dict of bond gauges to perform the compression with
+        respect to.
+    gauge_smudge : float, optional
+        If gauges are supplied, the smudge to use when gauging.
+    create_bond : bool, optional
+        If ``True``, and there is no bond between the two tensors, create a
+        new bond with size 1 before compressing. Else raise an error.
     info : None or dict, optional
         A dict for returning extra information such as the singular values.
     compress_opts :
         Supplied to :func:`~quimb.tensor.tensor_core.tensor_split`.
     """
-    lix, bix, rix = tensor_make_single_bond(T1, T2, gauges=gauges)
+    lix, bix, rix = tensor_make_single_bond(
+        T1, T2, gauges=gauges, create_bond=create_bond
+    )
     if not bix:
-        raise ValueError("The tensors specified don't share an bond.")
+        raise ValueError(
+            "The tensors specified don't share an bond. "
+            "To create one automatically, set `create_bond=True`."
+        )
 
     if gauges is not None:
         absorb = None
@@ -925,11 +992,7 @@ def tensor_compress_bond(
 
 
 @functools.singledispatch
-def tensor_balance_bond(
-    t1: "Tensor",
-    t2: "Tensor",
-    smudge=1e-6
-):
+def tensor_balance_bond(t1: "Tensor", t2: "Tensor", smudge=1e-6):
     """Gauge the bond between two tensors such that the norm of the 'columns'
     of the tensors on each side is the same for each index of the bond.
 
@@ -984,17 +1047,45 @@ def tensor_multifuse(ts, inds, gauges=None):
 def tensor_make_single_bond(
     t1: "Tensor",
     t2: "Tensor",
-    gauges=None
+    gauges=None,
+    create_bond=False,
 ):
     """If two tensors share multibonds, fuse them together and return the left
     indices, bond if it exists, and right indices. Handles simple ``gauges``.
     Inplace operation.
+
+    Parameters
+    ----------
+    t1 : Tensor
+        The first tensor.
+    t2 : Tensor
+        The second tensor.
+    gauges : dict, optional
+        A dictionary of gauge tensors, which will be updated in place.
+    create : bool, optional
+        If ``True``, create a new bond if none exists.
+
+    Returns
+    -------
+    left : list of str
+        Indices appearing only on the left tensor.
+    bond : str or None
+        The bond index of the tensors, or None if they don't share one and
+        ``create=False``.
+    right : list of str
+        Indices appearing only on the right tensor.
     """
     left, shared, right = group_inds(t1, t2)
     nshared = len(shared)
 
     if nshared == 0:
-        return left, None, right
+        if create_bond:
+            # create a new bond between the tensors
+            bond = rand_uuid()
+            new_bond(t1, t2, name=bond)
+            return left, bond, right
+        else:
+            return left, None, right
 
     if nshared > 1:
         tensor_multifuse((t1, t2), shared, gauges=gauges)
@@ -1103,7 +1194,7 @@ def array_direct_product(X, Y, sum_axes=()):
         else:
             if d1 != d2:
                 raise ValueError(
-                    "Can only add sum tensor " "indices of the same size."
+                    "Can only add sum tensor indices of the same size."
                 )
             padX.append((0, 0))
             padY.append((0, 0))
@@ -1207,11 +1298,23 @@ def tensor_network_sum(
 
 
 def bonds(
-    t1: "Tensor",
-    t2: "Tensor",
+    t1: "Tensor | TensorNetwork",
+    t2: "Tensor | TensorNetwork",
 ):
-    """Getting any indices connecting the Tensor(s) or TensorNetwork(s) ``t1``
+    """Get any indices shared between the Tensor(s) or TensorNetwork(s) ``t1``
     and ``t2``.
+
+    Parameters
+    ----------
+    t1 : Tensor or TensorNetwork
+        The first tensor or tensor network.
+    t2 : Tensor or TensorNetwork
+        The second tensor or tensor network.
+
+    Returns
+    -------
+    bonds : oset[str]
+        The indices shared between ``t1`` and ``t2``.
     """
     if isinstance(t1, Tensor):
         ix1 = oset(t1.inds)
@@ -1433,6 +1536,7 @@ def maybe_unwrap(
 
     return result
 
+
 # --------------------------------------------------------------------------- #
 #                                Tensor Class                                 #
 # --------------------------------------------------------------------------- #
@@ -1622,6 +1726,9 @@ class Tensor:
                 f"Tensor data contains non-finite values: {self.data}."
             )
 
+        if hasattr(self.data, "check"):
+            self.data.check()
+
     @property
     def owners(self):
         return self._owners
@@ -1724,9 +1831,10 @@ class Tensor:
 
     def isel(self, selectors, inplace=False):
         """Select specific values for some dimensions/indices of this tensor,
-        thereby removing them. Analogous to ``X[:, :, 3, :, :]`` with arrays.
-        The indices to select from can be specified either by integer, in which
-        case the correspoding index is removed, or by a slice.
+        thereby removing them. Analogous to __getitem__ syntax like
+        ``X[:, :, 3, :, 4:7]`` with arrays. The indices to select from can be
+        specified either by integer, in which case the correspoding index is
+        removed, or by a slice.
 
         Parameters
         ----------
@@ -1760,31 +1868,49 @@ class Tensor:
 
         new_inds = []
         data_loc = []
+        num_project = 0
 
         for ix in T.inds:
-            sel = selectors.get(ix, slice(None))
+
+            if ix not in selectors:
+                sel = slice(None)
+            else:
+                sel = selectors[ix]
+                num_project += 1
+
             if isinstance(sel, slice):
                 # index will be kept (including a partial slice of entries)
                 new_inds.append(ix)
                 data_loc.append(sel)
-            elif sel == "r":
+            elif isinstance(sel, str) and sel == "r":
                 # eagerly remove any 'random' selections
                 T.rand_reduce_(ix)
             else:
                 # index will be removed by selecting a specific index
-                data_loc.append(int(sel))
+                if isinstance(sel, str):
+                    sel = int(sel)
+                data_loc.append(sel)
 
-        T.modify(
-            apply=lambda x: x[tuple(data_loc)], inds=new_inds, left_inds=None
-        )
+
+        if num_project:
+            T.modify(
+                apply=lambda x: x[tuple(data_loc)],
+                inds=new_inds,
+                left_inds=None,
+            )
         return T
 
     isel_ = functools.partialmethod(isel, inplace=True)
 
     def add_tag(self, tag):
-        """Add a tag or multiple tags to this tensor. Unlike ``self.tags.add``
-        this also updates any ``TensorNetwork`` objects viewing this
-        ``Tensor``.
+        """Add a tag or multiple tags to this tensor. Unlike naively calling
+        `self.tags.add` this also updates the tag maps of all `TensorNetwork`
+        objects viewing this `Tensor`. Inplace operation.
+
+        Parameters
+        ----------
+        tag : str or sequence of str
+            The tag(s) to add to this tensor.
         """
         if isinstance(tag, str):
             tags = (tag,)
@@ -2011,6 +2137,68 @@ class Tensor:
 
     new_ind_pair_with_identity_ = functools.partialmethod(
         new_ind_pair_with_identity, inplace=True
+    )
+
+    def new_ind_pair_diag(
+        self, ind, new_left_ind, new_right_ind, inplace=False
+    ):
+        """Expand an existing index ``ind`` of this tensor into a new pair of
+        indices ``(new_left_ind, new_right_ind)`` each of matching size, such
+        that the old tensor is the diagonal of the new tensor. The new indices
+        are inserted at the position of ``ind``.
+
+        Parameters
+        ----------
+        ind : str
+            Name of the index to expand.
+        new_left_ind : str
+            Name of the new left index.
+        new_right_ind : str
+            Name of the new right index.
+        inplace : bool, optional
+            Whether to perform the expansion inplace.
+
+        Returns
+        -------
+        Tensor
+
+        Examples
+        --------
+        Expand the middle dimension of a 3-dimensional tensor::
+
+            t = qtn.rand_tensor((2, 3, 4), ('a', 'b', 'c'))
+            t.new_ind_pair_diag_('b', 'x', 'y')
+            # Tensor(shape=(2, 3, 3, 4), inds=('a', 'x', 'y', 'c'), tags=oset([]))
+        """
+        t = self if inplace else self.copy()
+
+        data = t.data
+        shape = t.shape
+        ax = t.inds.index(ind)
+
+        d = shape[ax]
+        shp_before = shape[:ax]
+        shp_after = shape[ax + 1 :]
+        new_shp = shp_before + (d, d) + shp_after
+        new_data = do("zeros", new_shp, like=data)
+
+        drange = do("arange", d, like=data)
+        selector = (
+            tuple(slice(None) for _ in shp_before)
+            + (drange, drange)
+            + tuple(slice(None) for _ in shp_after)
+        )
+        new_data[selector] = data
+
+        new_inds = (
+            t.inds[:ax] + (new_left_ind, new_right_ind) + t.inds[ax + 1 :]
+        )
+
+        t.modify(data=new_data, inds=new_inds)
+        return t
+
+    new_ind_pair_diag_ = functools.partialmethod(
+        new_ind_pair_diag, inplace=True
     )
 
     def conj(self, inplace=False):
@@ -2339,11 +2527,19 @@ class Tensor:
 
         Parameters
         ----------
+        ind : str
+            The index to contract with a random vector.
+        dtype : str
+            The data type of the random vector.
+        inplace : bool, optional
+            Whether to perform the reduction inplace.
+        kwargs
+            Passed to `quimb.randn`.
         """
         if dtype is None:
             dtype = self.dtype
 
-        v = randn(self.ind_size(ind), dtype=self.dtype, **kwargs)
+        v = randn(self.ind_size(ind), dtype=dtype, **kwargs)
 
         return self.vector_reduce(ind, v, inplace=inplace)
 
@@ -2845,7 +3041,7 @@ class Tensor:
         # NOTE: for compatibility with TN.norm, we accept contract_opts
         norm = norm_fro(self.data)
         if squared:
-            return norm ** 2
+            return norm**2
         return norm
 
     def overlap(self, other, **contract_opts):
@@ -3708,24 +3904,24 @@ def tensor_network_gate_inds(
                 'swap-split-gate', 'auto-split-gate'}, optional
         How to apply the gate:
 
-            - False: gate is added to network lazily and nothing is contracted,
-              tensor network structure is thus not maintained.
-            - True: gate is contracted eagerly with all tensors involved,
-              tensor network structure is thus only maintained if gate acts on
-              a single site only.
-            - 'split': contract all involved tensors then split the result back
-              into two.
-            - 'reduce-split': factor the two physical indices into 'R-factors'
-              using QR decompositions on the original site tensors, then
-              contract the gate, split it and reabsorb each side. Much cheaper
-              than ``'split'``.
-            - 'split-gate': lazily add the gate as with ``False``, but split
-              the gate tensor spatially.
-            - 'swap-split-gate': lazily add the gate as with ``False``, but
-              split the gate as if an extra SWAP has been applied.
-            - 'auto-split-gate': lazily add the gate as with ``False``, but
-              maybe apply one of the above options depending on whether they
-              result in a rank reduction.
+        - ``False``: gate is added to network lazily and nothing is contracted,
+          tensor network structure is thus not maintained.
+        - ``True``: gate is contracted eagerly with all tensors involved,
+          tensor network structure is thus only maintained if gate acts on a
+          single site only.
+        - ``'split'``: contract all involved tensors then split the result back
+          into two.
+        - ``'reduce-split'``: factor the two physical indices into 'R-factors'
+          using QR decompositions on the original site tensors, then contract
+          the gate, split it and reabsorb each side. Cheaper than ``'split'``
+          when the tensors on either side have at least 3 bonds.
+        - ``'split-gate'``: lazily add the gate as with ``False``, but split
+          the gate tensor spatially.
+        - ``'swap-split-gate'``: lazily add the gate as with ``False``, but
+          split the gate as if an extra SWAP has been applied.
+        - ``'auto-split-gate'``: lazily add the gate as with ``False``, but
+          maybe apply one of the above options depending on whether they result
+          in a rank reduction.
 
         The named methods are relevant for two site gates only, for single site
         gates they use the ``contract=True`` option which also maintains the
@@ -3783,7 +3979,7 @@ def tensor_network_gate_inds(
          ╱   ╱           ╱     ╱           ╱     ╱           ╱   ╱
         <QR> <LQ>                            <SVD>
 
-    For one site gates when one of these 'split' methods is supplied
+    For one site gates when one of the above 'split' methods is supplied
     ``contract=True`` is assumed.
 
     ``contract='split-gate'``::
@@ -4249,9 +4445,30 @@ class TensorNetwork(object):
         """The total number of indices in the tensor network."""
         return len(self.ind_map)
 
-    def pop_tensor(self, tid):
-        """Remove tensor with ``tid`` from this network, and return it."""
+    def pop_tensor(self, tid_or_tags, which="all") -> Tensor:
+        """Remove a tensor from this network, and return it.
+
+        Parameters
+        ----------
+        tid_or_tags : int or str or sequence of str
+            The tensor id or tag(s) to match.
+        which : {'all', 'any'}, optional
+            If supplying tags, whether to match all or any of the tags.
+            Default is 'all'.
+
+        Returns
+        -------
+        Tensor
+            The tensor that was removed.
+        """
         # pop the tensor itself
+
+        if isinstance(tid_or_tags, int):
+            tid = tid_or_tags
+        else:
+            # get the tensor ids from the tags
+            (tid,) = self._get_tids_from_tags(tid_or_tags, which=which)
+
         t = self.tensor_map.pop(tid)
 
         # remove the tid from the tag and ind maps
@@ -4346,16 +4563,44 @@ class TensorNetwork(object):
                     "Mismatched index dimension for index "
                     f"'{ix}' in tensors {ts}."
                 )
+            if len(ts) == 2 and hasattr(ts[0].data, "check_with"):
+                axa = ts[0].inds.index(ix)
+                axb = ts[1].inds.index(ix)
+                ts[0].data.check_with(ts[1].data, [axa], [axb])
 
-    def add_tag(self, tag, where=None, which="all"):
-        """Add tag to every tensor in this network, or if ``where`` is
+    def add_tag(self, tag, where=None, which="all", record=None):
+        """Add tag(s) to every tensor in this network, or if ``where`` is
         specified, the tensors matching those tags -- i.e. adds the tag to
-        all tensors in ``self.select_tensors(where, which=which)``.
+        all tensors in ``self.select_tensors(where, which=which)``. Inplace
+        operation.
+
+        Parameters
+        ----------
+        tag : str or sequence of str
+            The tag or tags to add.
+        where : str or sequence of str, optional
+            The existing tags to match for selection.
+        which : {'all', 'any', '!all', '!any'}, optional
+            How to match the ``where`` tags. Default is 'all', meaning a tensor
+            must have *all* of the specified tags to be selected.
+        record : None or dict, optional
+            A dictionary to record the tags added to each tensor. Useful for
+            untagging later at the Tensor level. The keys will be the
+            tensors themselves, and the values will be sets of tags that were
+            added. If ``None`` (the default), no record is kept.
         """
         tids = self._get_tids_from_tags(where, which=which)
 
         for tid in tids:
-            self.tensor_map[tid].add_tag(tag)
+            t = self.tensor_map[tid]
+            t.add_tag(tag)
+
+            if record is not None:
+                if isinstance(tag, str):
+                    record.setdefault(t, set()).add(tag)
+                else:
+                    # sequence of tags
+                    record.setdefault(t, set()).update(tag)
 
     def drop_tags(self, tags=None):
         """Remove a tag or tags from this tensor network, defaulting to all.
@@ -4561,7 +4806,7 @@ class TensorNetwork(object):
             # both are already copies
             virtual=True,
             # mangling already avoids clashes
-            check_collisions=not mangle_append
+            check_collisions=not mangle_append,
         )
 
         if return_all:
@@ -4583,7 +4828,7 @@ class TensorNetwork(object):
         norm2 = tn_norm.contract(output_inds=(), **contract_opts)
         if squared:
             return norm2
-        return norm2 ** 0.5
+        return norm2**0.5
 
     def make_overlap(
         self,
@@ -5225,9 +5470,7 @@ class TensorNetwork(object):
                 grow_from=grow_from,
             )
         else:
-            raise ValueError(
-                "`mode` must be `graphdistance` or `loopunion`."
-            )
+            raise ValueError("`mode` must be `graphdistance` or `loopunion`.")
 
         for _ in range(int(fillin)):
             # find any tids that are connected to the local region by two or
@@ -5283,7 +5526,7 @@ class TensorNetwork(object):
                 )
 
                 # full-rank decompose the outer tensor
-                l, r = self.tensor_map[tid_out].split(
+                _, r = self.tensor_map[tid_out].split(
                     left_inds=None,
                     right_inds=[ix],
                     max_bond=None,
@@ -5856,7 +6099,21 @@ class TensorNetwork(object):
         self._contract_between_tids(tid1, tid2, **contract_opts)
 
     def contract_ind(self, ind, output_inds=None, **contract_opts):
-        """Contract tensors connected by ``ind``."""
+        """Contract tensors connected by ``ind``. This is an inplace operation.
+
+        Parameters
+        ----------
+        ind : str
+            The index to contract over. All tensors connected by this index
+            will be contracted into a single tensor. Note that if `ind` is in
+            `output_inds` then it will still be retained on this tensor.
+        output_inds : str or sequence of str, optional
+            The output indices for the local contraction. If not given, they
+            will be calculated from the default outer indices of the full
+            tensor network.
+        contract_opts
+            Supplied to :func:`~quimb.tensor.tensor_core.tensor_contract`.
+        """
         tids = tuple(self._get_tids_from_inds(ind))
         output_inds = self.compute_contracted_inds(
             *tids, output_inds=output_inds
@@ -6879,6 +7136,7 @@ class TensorNetwork(object):
     gen_loops = gen_loops
     gen_patches = gen_patches
     gen_paths_loops = gen_paths_loops
+    gen_sloops = gen_sloops
     gen_gloops = gen_gloops
     get_local_patch = get_local_patch
     get_path_between_tids = get_path_between_tids
@@ -7463,7 +7721,7 @@ class TensorNetwork(object):
             if pbar is not None:
                 pbar.update()
                 pbar.set_description(
-                    f"max|dS|={max_sdiff:.2e}, " f"nfact={nfact:.2f}"
+                    f"max|dS|={max_sdiff:.2e}, nfact={nfact:.2f}"
                 )
 
             unconverged = (tol == 0.0) or (max_sdiff > tol)
@@ -8710,8 +8968,7 @@ class TensorNetwork(object):
 
         if d != db:
             raise ValueError(
-                f"This operator has dimension {d} but needs "
-                f"dimension {db}."
+                f"This operator has dimension {d} but needs dimension {db}."
             )
 
         # reindex one tensor, and add a new A tensor joining the bonds
@@ -8951,13 +9208,14 @@ class TensorNetwork(object):
         Parameters
         ----------
         tags : sequence of str, all, or Ellipsis, optional
-            Any tensors with any of these tags with be contracted. Use ``all``
+            Any tensors with any of these tags will be contracted. Use ``all``
             or ``...`` (``Ellipsis``) to contract all tensors. ``...`` will try
             and use a 'structured' contract method if possible.
         output_inds : sequence of str, optional
             The indices to specify as outputs of the contraction. If not given,
             and the tensor network has no hyper-indices, these are computed
-            automatically as every index appearing once.
+            automatically as every index appearing once. If the network has
+            hyper-indices, `output_inds` must be specified.
         optimize : str, PathOptimizer, ContractionTree or path_like, optional
             The contraction path optimization strategy to use.
 
@@ -8999,8 +9257,9 @@ class TensorNetwork(object):
             Which backend to use to perform the contraction. Supplied to
             `cotengra`.
         inplace : bool, optional
-            Whether to perform the contraction inplace. This is only valid
-            if not all tensors are contracted (which doesn't produce a TN).
+            Whether to perform the contraction inplace. If ``True`` and all
+            tensors are being contracted, this forces the return type to
+            be preserved as a ``TensorNetwork``.
         kwargs
             Passed to :func:`~quimb.tensor.tensor_core.tensor_contract`,
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.contract_compressed`
@@ -9010,7 +9269,7 @@ class TensorNetwork(object):
         -------
         TensorNetwork, Tensor or scalar
             The result of the contraction, still a ``TensorNetwork`` if the
-            contraction was only partial.
+            contraction was only partial or `inplace=True` was used.
 
         See Also
         --------
@@ -9043,7 +9302,6 @@ class TensorNetwork(object):
         # this checks whether certain TN classes have a manually specified
         #     contraction pattern (e.g. 1D along the line)
         if self._CONTRACT_STRUCTURED:
-
             if (tags is ...) or isinstance(tags, slice):
                 return self.contract_structured(
                     tags,
@@ -9054,20 +9312,16 @@ class TensorNetwork(object):
 
         # contracting everything to single output
         if all_tags and not inplace:
-
             return tensor_contract(
                 *self.tensor_map.values(),
                 strip_exponent=strip_exponent,
                 exponent=self.exponent,
-                **kwargs
+                **kwargs,
             )
 
         # contract some or all tensors, but keeping tensor network
         return self.contract_tags(
-            tags,
-            strip_exponent=strip_exponent,
-            inplace=inplace,
-            **kwargs
+            tags, strip_exponent=strip_exponent, inplace=inplace, **kwargs
         )
 
     contract_ = functools.partialmethod(contract, inplace=True)
@@ -9138,7 +9392,7 @@ class TensorNetwork(object):
                 c_tags,
                 which="any",
                 equalize_norms=equalize_norms,
-                **contract_opts
+                **contract_opts,
             )
 
             if tn.num_tensors == 1:
@@ -9367,7 +9621,7 @@ class TensorNetwork(object):
 
     def trace(self, left_inds, right_inds, **contract_opts):
         """Trace over ``left_inds`` joined with ``right_inds``"""
-        tn = self.reindex({u: l for u, l in zip(left_inds, right_inds)})
+        tn = self.reindex(dict(zip(left_inds, right_inds)))
         return tn.contract_tags(..., **contract_opts)
 
     def to_dense(self, *inds_seq, to_qarray=False, **contract_opts):
@@ -9440,15 +9694,20 @@ class TensorNetwork(object):
         if side == "right":
             # form dag(X) @ X --> left_inds are contracted
             ixmap = {ix: rand_uuid() for ix in right_inds}
+            lix = ixmap.values()
+            rix = ixmap.keys()
         else:  # 'left'
             # form X @ dag(X) --> right_inds are contracted
             ixmap = {ix: rand_uuid() for ix in left_inds}
+            lix = ixmap.keys()
+            rix = ixmap.values()
+
+        # note: problem is hermitian but we still need to get
+        # lix and rix correct way round for blocksparse arrays
 
         # contract to dense array
         tnd = self.reindex(ixmap).conj_() & self
-        XX = tnd.to_dense(
-            ixmap.values(), ixmap.keys(), optimize=optimize, **contract_opts
-        )
+        XX = tnd.to_dense(lix, rix, optimize=optimize, **contract_opts)
 
         return decomp.squared_op_to_reduced_factor(
             XX,
@@ -9463,12 +9722,17 @@ class TensorNetwork(object):
         rtags,
         max_bond=None,
         cutoff=1e-10,
+        mode="oblique",
+        max_bond_oversample="auto",
         select_which="any",
         insert_into=None,
         new_tags=None,
         new_ltags=None,
         new_rtags=None,
         bond_ind=None,
+        gauges=None,
+        gauge_smudge=0.0,
+        gauge_power=1.0,
         optimize="auto-hq",
         inplace=False,
         **compress_opts,
@@ -9490,6 +9754,8 @@ class TensorNetwork(object):
             is controlled by ``cutoff``.
         cutoff : float, optional
             The cutoff to use for the compression.
+        mode : {"oblique", "nystrom"}, optional
+            How to compute the projectors.
         select_which : {'any', 'all', 'none'}, optional
             How to select the regions based on the tags, see
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.select`.
@@ -9526,33 +9792,103 @@ class TensorNetwork(object):
         tn = self if (inplace or (insert_into is not None)) else self.copy()
 
         # get views of the left and right regions - 'X' and 'Y'
-        ltn = tn.select(ltags, which=select_which)
-        rtn = tn.select(rtags, which=select_which)
+        ltn = tn.select(ltags, which=select_which, virtual=False)
+        rtn = tn.select(rtags, which=select_which, virtual=False)
+
+        if gauges is not None:
+            (ltn | rtn).gauge_simple_insert(
+                gauges, smudge=gauge_smudge, power=gauge_power
+            )
 
         # get the connecting indices and corresponding sizes
         bix = bonds(ltn, rtn)
-        bix_sizes = [tn.ind_size(ix) for ix in bix]
+        bix_sizes = [ltn.ind_size(ix) for ix in bix]
 
-        # contract the reduced factors
-        Rl = ltn.compute_reduced_factor("right", None, bix, optimize=optimize)
-        Rr = rtn.compute_reduced_factor("left", bix, None, optimize=optimize)
+        if mode == "nystrom":
+            # only use
+            lix = [ix for ix in ltn.outer_inds() if ix not in bix]
+            rix = [ix for ix in rtn.outer_inds() if ix not in bix]
+            dbond = prod(bix_sizes)
+            dleft = prod(map(ltn.ind_size, lix))
+            dright = prod(map(rtn.ind_size, rix))
+            current_rank = min(dbond, dleft, dright)
+            # if current_rank <= max_bond:
+            # mode = "oblique"
 
-        # then form the 'oblique' projectors
-        Pl, Pr = decomp.compute_oblique_projectors(
-            Rl,
-            Rr,
-            max_bond=max_bond,
-            cutoff=cutoff,
-            **compress_opts,
-        )
+        if mode == "oblique":
+            # contract the reduced factors
+            Rl = ltn.compute_reduced_factor(
+                "right", None, bix, optimize=optimize
+            )
+            Rr = rtn.compute_reduced_factor(
+                "left", bix, None, optimize=optimize
+            )
+
+            # then form the 'oblique' projectors
+            Pl, Pr = decomp.compute_oblique_projectors(
+                Rl,
+                Rr,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                **compress_opts,
+            )
+        elif mode == "nystrom":
+            from .tensor_builder import rand_tensor
+            from .decomp import svd_truncated, rdmul, ldmul
+
+            #
+            max_bond = min(current_rank, max_bond)
+
+            if callable(max_bond_oversample):
+                max_bond_oversample = max_bond_oversample(max_bond)
+            elif max_bond_oversample == "auto":
+                max_bond_oversample = max(max_bond * 2, max_bond + 20)
+
+            ixbl = rand_uuid()
+            for ix in lix:
+                ltn |= rand_tensor(
+                    shape=(max_bond_oversample, ltn.ind_size(ix)),
+                    inds=(ixbl, ix),
+                    dist="rademacher",
+                )
+            tml = ltn.contract(
+                all, optimize="auto-hq", output_inds=(ixbl, *bix)
+            )
+
+            ixbr = rand_uuid()
+            for ix in rix:
+                rtn |= rand_tensor(
+                    shape=(rtn.ind_size(ix), max_bond_oversample),
+                    inds=(ix, ixbr),
+                    dist="rademacher",
+                )
+            tmr = rtn.contract(
+                all, optimize="auto-hq", output_inds=(*bix, ixbr)
+            )
+
+            Ml = tml.to_dense((ixbl,), bix)
+            Mr = tmr.to_dense(bix, (ixbr,))
+
+            U, s, VH = svd_truncated(
+                Ml @ Mr,
+                cutoff=cutoff,
+                max_bond=max_bond,
+                absorb=None,
+                **compress_opts,
+            )
+            sqi = s**-0.5
+            Pl = Mr @ rdmul(dag(VH), sqi)
+            Pr = ldmul(sqi, dag(U)) @ Ml
+        else:
+            raise ValueError(f"mode `{mode}` is invalid.")
 
         Pl = do("reshape", Pl, (*bix_sizes, -1))
         Pr = do("reshape", Pr, (-1, *bix_sizes))
 
         if insert_into is not None:
             tn = insert_into
-            ltn = tn.select(ltags, which=select_which)
-            rtn = tn.select(rtags, which=select_which)
+        ltn = tn.select(ltags, which=select_which)
+        rtn = tn.select(rtags, which=select_which)
 
         # finally cut the bonds
         new_lix = [rand_uuid() for _ in bix]
@@ -11092,10 +11428,12 @@ class TensorNetwork(object):
         ----------
         mode : {'dense', 'mps', 'tree'}, optional
             What type of COPY tensor(s) to insert.
-        sorter : None or callable, optional
+        sorter : None, callable, "centrality", or "clustering", optional
             If given, a function to sort the indices that a single hyperindex
             will be turned into. Th function is called like
-            ``tids.sort(key=sorter)``.
+            ``tids.sort(key=sorter)``. "centrality" will sort by the
+            centrality of the tensors, "clustering" will sort using a
+            hierarchical clustering.
         inplace : bool, optional
             Whether to insert the COPY tensors inplace.
 

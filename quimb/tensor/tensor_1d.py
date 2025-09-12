@@ -508,15 +508,22 @@ class TensorNetwork1D(TensorNetworkGen):
         return x
 
     def contract_structured(
-        self, tag_slice, structure_bsz=5, inplace=False, **opts
+        self,
+        tag_slice,
+        structure_bsz=5,
+        optimize="auto",
+        inplace=False,
+        **contract_opts,
     ):
         """Perform a structured contraction, translating ``tag_slice`` from a
         ``slice`` or `...` to a cumulative sequence of tags.
 
         Parameters
         ----------
-        tag_slice : slice or ...
+        tag_slice : slice or ... (Ellipsis)
             The range of sites, or `...` for all.
+        structure_bsz : int, optional
+            The number of sites to group together for each sub-contraction.
         inplace : bool, optional
             Whether to perform the contraction inplace.
 
@@ -535,6 +542,10 @@ class TensorNetwork1D(TensorNetworkGen):
             # else slice over all sites
             tag_slice = slice(0, self.L)
 
+        if optimize is None:
+            # this helps a lot vs greedy for large bond triple overlap e.g.
+            optimize = "auto"
+
         # filter sites by the slice, but also which sites are present at all
         tags_seq = filter(
             self.tag_map.__contains__,
@@ -546,7 +557,12 @@ class TensorNetwork1D(TensorNetworkGen):
             tags_seq = partition_all(structure_bsz, tags_seq)
 
         # contract each block of sites cumulatively
-        return self.contract_cumulative(tags_seq, inplace=inplace, **opts)
+        return self.contract_cumulative(
+            tags_seq,
+            optimize=optimize,
+            inplace=inplace,
+            **contract_opts,
+        )
 
     def compute_left_environments(self, **contract_opts):
         """Compute the left environments of this 1D tensor network.
@@ -779,7 +795,7 @@ class TensorNetwork1DFlat(TensorNetwork1D):
 
     _EXTRA_PROPS = ("_site_tag_id", "_L")
 
-    def left_canonize_site(self, i, bra=None):
+    def left_canonize_site(self, i, bra=None, create_bond=False):
         r"""Left canonize this TN's ith site, inplace::
 
                 i                i
@@ -793,15 +809,18 @@ class TensorNetwork1DFlat(TensorNetwork1D):
             non-isometric part of the decomposition of site i.
         bra : None or matching TensorNetwork to self, optional
             If set, also update this TN's data with the conjugate canonization.
+        create_bond : bool, optional
+            Whether to create a new bond between the two tensors if none
+            exists. If False, an error will be raised in such a case.
         """
         tl, tr = self[i], self[i + 1]
-        tensor_canonize_bond(tl, tr)
+        tensor_canonize_bond(tl, tr, create_bond=create_bond)
         if bra is not None:
             # TODO: handle left inds
             bra[i].modify(data=conj(tl.data))
             bra[i + 1].modify(data=conj(tr.data))
 
-    def right_canonize_site(self, i, bra=None):
+    def right_canonize_site(self, i, bra=None, create_bond=False):
         r"""Right canonize this TN's ith site, inplace::
 
                   i                i
@@ -813,11 +832,14 @@ class TensorNetwork1DFlat(TensorNetwork1D):
         i : int
             Which site to canonize. The site at i - 1 also absorbs the
             non-isometric part of the decomposition of site i.
-         bra : None or matching TensorNetwork to self, optional
+        bra : None or matching TensorNetwork to self, optional
             If set, also update this TN's data with the conjugate canonization.
+        create_bond : bool, optional
+            Whether to create a new bond between the two tensors if none
+            exists. If False, an error will be raised in such a case.
         """
         tl, tr = self[i - 1], self[i]
-        tensor_canonize_bond(tr, tl)
+        tensor_canonize_bond(tr, tl, create_bond=create_bond)
         if bra is not None:
             # TODO: handle left inds
             bra[i].modify(data=conj(tr.data))
@@ -829,6 +851,7 @@ class TensorNetwork1DFlat(TensorNetwork1D):
         start=None,
         normalize=False,
         bra=None,
+        create_bond=False,
         inplace=False,
     ):
         r"""Left canonicalize all or a portion of this TN (i.e. sweep the
@@ -851,6 +874,9 @@ class TensorNetwork1DFlat(TensorNetwork1D):
         bra : MatrixProductState, optional
             If supplied, simultaneously left canonicalize this MPS too,
             assuming it to be the conjugate state.
+        create_bond : bool, optional
+            Whether to create new bonds between the two tensors if none
+            exists. If False, an error will be raised in such a case.
         inplace : bool, optional
             Whether to perform the operation inplace. If ``bra`` is supplied
             then it is always modifed inplace.
@@ -867,7 +893,7 @@ class TensorNetwork1DFlat(TensorNetwork1D):
             stop = mps.L - 1
 
         for i in range(start, stop):
-            mps.left_canonize_site(i, bra=bra)
+            mps.left_canonize_site(i, bra=bra, create_bond=create_bond)
 
         if normalize:
             factor = mps[-1].norm()
@@ -883,7 +909,13 @@ class TensorNetwork1DFlat(TensorNetwork1D):
     left_canonize = left_canonicalize_
 
     def right_canonicalize(
-        self, stop=None, start=None, normalize=False, bra=None, inplace=False
+        self,
+        stop=None,
+        start=None,
+        normalize=False,
+        bra=None,
+        create_bond=False,
+        inplace=False,
     ):
         r"""Right canonicalize all or a portion of this TN (i.e. sweep the
         orthogonality center to the left). If this is a MPS,
@@ -905,6 +937,9 @@ class TensorNetwork1DFlat(TensorNetwork1D):
         bra : MatrixProductState, optional
             If supplied, simultaneously right canonicalize this MPS too,
             assuming it to be the conjugate state.
+        create_bond : bool, optional
+            Whether to create new bonds between the two tensors if none
+            exists. If False, an error will be raised in such a case.
         inplace : bool, optional
             Whether to perform the operation inplace. If ``bra`` is supplied
             then it is always modifed inplace.
@@ -921,7 +956,7 @@ class TensorNetwork1DFlat(TensorNetwork1D):
             stop = 0
 
         for i in range(start, stop, -1):
-            mps.right_canonize_site(i, bra=bra)
+            mps.right_canonize_site(i, bra=bra, create_bond=create_bond)
 
         if normalize:
             factor = mps[0].norm()
@@ -1001,7 +1036,13 @@ class TensorNetwork1DFlat(TensorNetwork1D):
             for i in (start - 1, start, stop, stop - 1):
                 bra[i].modify(data=self[i].data.conj())
 
-    def shift_orthogonality_center(self, current, new, bra=None):
+    def shift_orthogonality_center(
+        self,
+        current,
+        new,
+        bra=None,
+        create_bond=False,
+    ):
         """Move the orthogonality center of this MPS.
 
         Parameters
@@ -1013,13 +1054,16 @@ class TensorNetwork1DFlat(TensorNetwork1D):
         bra : MatrixProductState, optional
             If supplied, simultaneously move the orthogonality center of this
             MPS too, assuming it to be the conjugate state.
+        create_bond : bool, optional
+            Whether to create new bonds between two tensors if none
+            exists. If False, an error will be raised in such a case.
         """
         if new > current:
             for i in range(current, new):
-                self.left_canonize_site(i, bra=bra)
+                self.left_canonize_site(i, bra=bra, create_bond=create_bond)
         else:
             for i in range(current, new, -1):
-                self.right_canonize_site(i, bra=bra)
+                self.right_canonize_site(i, bra=bra, create_bond=create_bond)
 
     def canonicalize(
         self,
@@ -1027,6 +1071,7 @@ class TensorNetwork1DFlat(TensorNetwork1D):
         cur_orthog="calc",
         info=None,
         bra=None,
+        create_bond=False,
         inplace=False,
     ):
         r"""Gauge this MPS into mixed canonical form, implying::
@@ -1063,6 +1108,9 @@ class TensorNetwork1DFlat(TensorNetwork1D):
         bra : MatrixProductState, optional
             If supplied, simultaneously mixed canonicalize this MPS too,
             assuming it to be the conjugate state.
+        create_bond : bool, optional
+            Whether to create new bonds between two tensors if none
+            exists. If False, an error will be raised in such a case.
         inplace : bool, optional
             Whether to perform the operation inplace. If ``bra`` is supplied
             then it is always modifed inplace.
@@ -1091,12 +1139,16 @@ class TensorNetwork1DFlat(TensorNetwork1D):
                 cmin, cmax = min(cur_orthog), max(cur_orthog)
 
             if i > cmin:
-                mps.shift_orthogonality_center(cmin, i, bra=bra)
+                mps.shift_orthogonality_center(
+                    current=cmin, new=i, bra=bra, create_bond=create_bond
+                )
             else:
                 i = min(j, cmin)
 
             if j < cmax:
-                mps.shift_orthogonality_center(cmax, j, bra=bra)
+                mps.shift_orthogonality_center(
+                    current=cmax, new=j, bra=bra, create_bond=create_bond
+                )
             else:
                 j = max(i, cmax)
 
@@ -1111,7 +1163,9 @@ class TensorNetwork1DFlat(TensorNetwork1D):
     canonicalize_ = functools.partialmethod(canonicalize, inplace=True)
     canonize = canonicalize_
 
-    def left_compress_site(self, i, bra=None, **compress_opts):
+    def left_compress_site(
+        self, i, bra=None, create_bond=False, **compress_opts
+    ):
         """Left compress this 1D TN's ith site, such that the site is then
         left unitary with its right bond (possibly) reduced in dimension.
 
@@ -1121,22 +1175,29 @@ class TensorNetwork1DFlat(TensorNetwork1D):
             Which site to compress.
         bra : None or matching TensorNetwork to self, optional
             If set, also update this TN's data with the conjugate compression.
+        create_bond : bool, optional
+            Whether to create new bonds between the two tensors if none
+            exists. If False, an error will be raised in such a case.
         compress_opts
-            Supplied to :meth:`Tensor.split`.
+            Supplied to :meth:`Tensor.split`. By default absorb is set to
+            ``'right'`` and reduced to ``'left'``. Other notable options are
+            ``max_bond`` and ``cutoff``.
         """
         set_default_compress_mode(compress_opts, self.cyclic)
         compress_opts.setdefault("absorb", "right")
         compress_opts.setdefault("reduced", "left")
 
         tl, tr = self[i], self[i + 1]
-        tensor_compress_bond(tl, tr, **compress_opts)
+        tensor_compress_bond(tl, tr, create_bond=create_bond, **compress_opts)
 
         if bra is not None:
             # TODO: handle left inds
             bra[i].modify(data=conj(tl.data))
             bra[i + 1].modify(data=conj(tr.data))
 
-    def right_compress_site(self, i, bra=None, **compress_opts):
+    def right_compress_site(
+        self, i, bra=None, create_bond=False, **compress_opts
+    ):
         """Right compress this 1D TN's ith site, such that the site is then
         right unitary with its left bond (possibly) reduced in dimension.
 
@@ -1146,22 +1207,34 @@ class TensorNetwork1DFlat(TensorNetwork1D):
             Which site to compress.
         bra : None or matching TensorNetwork to self, optional
             If set, update this TN's data with the conjugate compression.
+        create_bond : bool, optional
+            Whether to create new bonds between the two tensors if none
+            exists. If False, an error will be raised in such a case.
         compress_opts
-            Supplied to :meth:`Tensor.split`.
+            Supplied to :meth:`Tensor.split`. By default absorb is set to
+            ``'left'`` and reduced to ``'right'``. Other notable options are
+            ``max_bond`` and ``cutoff``.
         """
         set_default_compress_mode(compress_opts, self.cyclic)
         compress_opts.setdefault("absorb", "left")
         compress_opts.setdefault("reduced", "right")
 
         tl, tr = self[i - 1], self[i]
-        tensor_compress_bond(tl, tr, **compress_opts)
+        tensor_compress_bond(tl, tr, create_bond=create_bond, **compress_opts)
 
         if bra is not None:
             # TODO: handle left inds
             bra[i].modify(data=conj(tr.data))
             bra[i - 1].modify(data=conj(tl.data))
 
-    def left_compress(self, start=None, stop=None, bra=None, **compress_opts):
+    def left_compress(
+        self,
+        start=None,
+        stop=None,
+        bra=None,
+        create_bond=False,
+        **compress_opts,
+    ):
         """Compress this 1D TN, from left to right, such that it becomes
         left-canonical (unless ``absorb != 'right'``).
 
@@ -1173,8 +1246,12 @@ class TensorNetwork1DFlat(TensorNetwork1D):
             Site to stop compressing at (won't itself be an isometry).
         bra : None or TensorNetwork like this one, optional
             If given, update this TN as well, assuming it to be the conjugate.
+        create_bond : bool, optional
+            Whether to create new bonds between adjacent tensors if none
+            exists. If False, an error will be raised in such a case.
         compress_opts
-            Supplied to :meth:`Tensor.split`.
+            Supplied to :meth:`Tensor.split`. Notably, ``max_bond``,
+            ``cutoff``.
         """
         if start is None:
             start = -1 if self.cyclic else 0
@@ -1182,9 +1259,18 @@ class TensorNetwork1DFlat(TensorNetwork1D):
             stop = self.L - 1
 
         for i in range(start, stop):
-            self.left_compress_site(i, bra=bra, **compress_opts)
+            self.left_compress_site(
+                i, bra=bra, create_bond=create_bond, **compress_opts
+            )
 
-    def right_compress(self, start=None, stop=None, bra=None, **compress_opts):
+    def right_compress(
+        self,
+        start=None,
+        stop=None,
+        bra=None,
+        create_bond=False,
+        **compress_opts,
+    ):
         """Compress this 1D TN, from right to left, such that it becomes
         right-canonical (unless ``absorb != 'left'``).
 
@@ -1196,8 +1282,12 @@ class TensorNetwork1DFlat(TensorNetwork1D):
             Site to stop compressing at (won't itself be an isometry).
         bra : None or TensorNetwork like this one, optional
             If given, update this TN as well, assuming it to be the conjugate.
+        create_bond : bool, optional
+            Whether to create new bonds between adjacent tensors if none
+            exists. If False, an error will be raised in such a case.
         compress_opts
-            Supplied to :meth:`Tensor.split`.
+            Supplied to :meth:`Tensor.split`. Notably, ``max_bond``,
+            ``cutoff``.
         """
         if start is None:
             start = self.L - (0 if self.cyclic else 1)
@@ -1205,49 +1295,63 @@ class TensorNetwork1DFlat(TensorNetwork1D):
             stop = 0
 
         for i in range(start, stop, -1):
-            self.right_compress_site(i, bra=bra, **compress_opts)
+            self.right_compress_site(
+                i, bra=bra, create_bond=create_bond, **compress_opts
+            )
 
-    def compress(self, form=None, **compress_opts):
+    def compress(self, form=None, create_bond=False, **compress_opts):
         """Compress this 1D Tensor Network, possibly into canonical form.
 
         Parameters
         ----------
-        form : {None, 'flat', 'left', 'right'} or int
-            Output form of the TN. ``None`` left canonizes the state first for
-            stability reasons, then right_compresses (default). ``'flat'``
-            tries to distribute the singular values evenly -- state will not
-            be canonical. ``'left'`` and ``'right'`` put the state into left
-            and right canonical form respectively with a prior opposite sweep,
-            or an int will put the state into mixed canonical form at that
-            site.
+        form : None, int, 'right', 'left' or 'flat', optional
+            Output form of the TN. The default `None` currently maps to
+            'right'. `'right'` results in a right canonical TN,
+            with orthogonality center at site 0. `'left'` results in a
+            left canonical TN, with orthogonality center at site L - 1.
+            An integer value specifies the desired orthogonality center.
+            `'flat'` is a non-canonical method that performs a sweep of
+            compressions only (no canonicalization) from both sides.
+        create_bond : bool, optional
+            Whether to create new bonds between adjacent tensors if none
+            exists. If False, an error will be raised in such a case.
         compress_opts
-            Supplied to :meth:`Tensor.split`.
+            Supplied to :meth:`Tensor.split`. Notably, ``max_bond``,
+            ``cutoff``.
         """
         if form is None:
             form = "right"
 
         if isinstance(form, Integral):
             if form < self.L // 2:
-                self.left_canonize()
+                self.left_canonize(create_bond=create_bond)
                 self.right_compress(**compress_opts)
                 self.left_canonize(stop=form)
             else:
-                self.right_canonize()
+                self.right_canonize(create_bond=create_bond)
                 self.left_compress(**compress_opts)
                 self.right_canonize(stop=form)
 
         elif form == "left":
-            self.right_canonize(bra=compress_opts.get("bra", None))
+            self.right_canonize(
+                bra=compress_opts.get("bra", None), create_bond=create_bond
+            )
             self.left_compress(**compress_opts)
 
         elif form == "right":
-            self.left_canonize(bra=compress_opts.get("bra", None))
+            self.left_canonize(
+                bra=compress_opts.get("bra", None), create_bond=create_bond
+            )
             self.right_compress(**compress_opts)
 
         elif form == "flat":
             compress_opts["absorb"] = "both"
-            self.right_compress(stop=self.L // 2, **compress_opts)
-            self.left_compress(stop=self.L // 2, **compress_opts)
+            self.right_compress(
+                stop=self.L // 2, create_bond=create_bond, **compress_opts
+            )
+            self.left_compress(
+                stop=self.L // 2, create_bond=create_bond, **compress_opts
+            )
 
         else:
             raise ValueError(
@@ -1373,11 +1477,27 @@ class TensorNetwork1DFlat(TensorNetwork1D):
         left_inds = Tm1.bonds(self[i - 1])
         return Tm1.singular_values(left_inds, method=method)
 
+    def ensure_bonds_exist(self):
+        """Ensure that all bonds between adjacent sites are present in the
+        tensor network, creating new bonds of size 1 if necessary.
+        """
+        for i in range(self.L - 1):
+            ti = self[i]
+            tj = self[i + 1]
+            if not ti.bonds(tj):
+                ti.new_bond(tj)
+        if self.cyclic:
+            ti = self[-1]
+            tj = self[0]
+            if not ti.bonds(tj):
+                ti.new_bond(tj)
+
     def expand_bond_dimension(
         self,
         new_bond_dim,
         rand_strength=0.0,
         bra=None,
+        create_bond=False,
         inplace=True,
     ):
         """Expand the bond dimensions of this 1D tensor network to at least
@@ -1387,23 +1507,31 @@ class TensorNetwork1DFlat(TensorNetwork1D):
         ----------
         new_bond_dim : int
             Minimum bond dimension to expand to.
-        inplace : bool, optional
-            Whether to perform the expansion in place.
-        bra : MatrixProductState, optional
-            Mirror the changes to ``bra`` inplace, treating it as the conjugate
-            state.
         rand_strength : float, optional
             If ``rand_strength > 0``, fill the new tensor entries with gaussian
             noise of strength ``rand_strength``.
+        bra : MatrixProductState, optional
+            Mirror the changes to ``bra`` inplace, treating it as the conjugate
+            state.
+        create_bond : bool, optional
+            Whether to create new bonds between adjacent tensors if none
+            exists. If ``False``, unconnected sites will remain unconnected.
+        inplace : bool, optional
+            Whether to perform the expansion in place.
 
         Returns
         -------
         MatrixProductState
         """
+        tn = self if inplace else self.copy()
+
+        if create_bond:
+            tn.ensure_bonds_exist()
+
         tn = super().expand_bond_dimension(
             new_bond_dim=new_bond_dim,
             rand_strength=rand_strength,
-            inplace=inplace,
+            inplace=True,
         )
 
         if bra is not None:
@@ -1413,6 +1541,15 @@ class TensorNetwork1DFlat(TensorNetwork1D):
         return tn
 
     def count_canonized(self):
+        """Count the number of canonical sites to the left and right of the
+        tensor network. For cyclic TNs, this is always 0.
+
+        Returns
+        -------
+        (int, int)
+            The number of canonical sites to the left and right of the
+            orthogonality center.
+        """
         if self.cyclic:
             return 0, 0
 
@@ -1521,9 +1658,10 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
         taken as the max ``sites`` value plus one (i.e.g the number of arrays
         if ``sites`` is not given).
     shape : str, optional
-        String specifying layout of the tensors. E.g. 'lrp' (the default)
+        String specifying layout of *input* arrays. E.g. 'lrp' (the default)
         indicates the shape corresponds left-bond, right-bond, physical index.
-        End tensors have either 'l' or 'r' dropped from the string.
+        End tensors have either 'l' or 'r' dropped from the string. The
+        arrays will be permuted to 'lrp' order.
     tags : str or sequence of str, optional
         Global tags to attach to all tensors.
     site_ind_id : str
@@ -1579,31 +1717,45 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
         self._site_tag_id = site_tag_id
         self.cyclic = ops.ndim(arrays[0]) == 3
 
-        # this is the perm needed to bring the arrays from
-        # their current `shape`, to the desired 'lrud' order
-        lrp_ord = tuple(map(shape.find, "lrp"))
-
         tensors = []
         tags = tags_to_oset(tags)
         bonds = [rand_uuid() for _ in range(num_sites)]
+        # account for cyclic case
         bonds.append(bonds[0])
 
         for i, (site, array) in enumerate(zip(sites, arrays)):
             inds = []
 
-            if (i == 0) and not self.cyclic:
+            if L == 1:
+                # only one site
+                if self.cyclic:
+                    # bond is a self loop on the single tensor
+                    shape_desired = "lrp"
+                    inds.append(bonds[i])
+                    inds.append(bonds[i])
+                    # XXX: should we just trace it out instead?
+                else:
+                    # no bonds, just physical index
+                    shape_desired = "p"
+
+            elif (i == 0) and not self.cyclic:
                 # only right bond
-                order = tuple(shape.replace("l", "").find(x) for x in "rp")
+                shape_desired = "rp"
                 inds.append(bonds[i + 1])
             elif (i == num_sites - 1) and not self.cyclic:
                 # only left bond
-                order = tuple(shape.replace("r", "").find(x) for x in "lp")
+                shape_desired = "lp"
                 inds.append(bonds[i])
             else:
-                order = lrp_ord
+                shape_desired = "lrp"
                 # both bonds
                 inds.append(bonds[i])
                 inds.append(bonds[i + 1])
+
+            # this is the perm needed to bring the arrays from
+            # their current `shape`, to the desired 'lrud' order
+            shape_given = [x for x in shape if x in shape_desired]
+            order = [shape_given.index(x) for x in shape_desired]
 
             # physical index
             inds.append(site_ind_id.format(site))
@@ -1653,9 +1805,10 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
         cyclic : bool, optional
             Whether the MPS should be cyclic (periodic).
         shape : str, optional
-            What specific order to layout the indices in, should be a sequence
-            of ``'l'``, ``'r'``, and ``'p'``, corresponding to left, right, and
-            physical indices respectively.
+            String specifying layout of *input* arrays. E.g. 'lrp' (the
+            default) indicates the shape corresponds left-bond, right-bond,
+            physical index. End tensors have either 'l' or 'r' dropped from the
+            string. The arrays will be permuted to 'lrp' order.
         site_ind_id : str, optional
             How to label the physical site indices.
         site_tag_id : str, optional
@@ -1818,7 +1971,7 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
     add_MPS_ = functools.partialmethod(add_MPS, inplace=True)
 
     def permute_arrays(self, shape="lrp"):
-        """Permute the indices of each tensor in this MPS to match ``shape``.
+        """Ensure the arrays are stored internally in the specified order.
         This doesn't change how the overall object interacts with other tensor
         networks but may be useful for extracting the underlying arrays
         consistently. This is an inplace operation.
@@ -1826,9 +1979,11 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
         Parameters
         ----------
         shape : str, optional
-            A permutation of ``'lrp'`` specifying the desired order of the
-            left, right, and physical indices respectively.
+            A permutation of ``'lrp'`` specifying the *desired* order of the
+            [l]eft, [r]ight, and [p]hysical indices respectively.
         """
+        self.ensure_bonds_exist()
+
         for i in self.gen_sites_present():
             inds = {"p": self.site_ind(i)}
             if self.cyclic or i > 0:
@@ -2246,7 +2401,8 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
         inplace : bool, optional
             Whether to perform the compression inplace.
         inplace_mpo : bool, optional
-            Whether the modify the MPO in place, a minor performance gain.
+            Whether to reindex the operator tensor network ``mpo`` inplace, a
+            minor performance gain if you don't need to use it afterwards.
         compress_opts
             Other options supplied to
             :func:`~quimb.tensor.tensor_1d_compress.tensor_network_1d_compress`.
@@ -2263,7 +2419,7 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
         psi.gate_with_op_lazy_(
             mpo,
             transpose=transpose,
-            inplace=inplace_mpo,
+            inplace_op=inplace_mpo,
         )
 
         # compress it!
@@ -2578,7 +2734,7 @@ class MatrixProductState(TensorNetwork1DVector, TensorNetwork1DFlat):
 
     def ptr(self, *_, **__):
         raise AttributeError(
-            "`mps.ptr` has been renamed " "to `mps.partial_trace_to_mpo`."
+            "`mps.ptr` has been renamed to `mps.partial_trace_to_mpo`."
         )
 
     def partial_trace_to_dense_canonical(
@@ -3691,10 +3847,11 @@ class MatrixProductOperator(TensorNetwork1DOperator, TensorNetwork1DFlat):
         taken as the max ``sites`` value plus one (i.e.g the number of arrays
         if ``sites`` is not given).
     shape : str, optional
-        String specifying layout of the tensors. E.g. 'lrud' (the default)
-        indicates the shape corresponds left-bond, right-bond, 'up' physical
-        index, 'down' physical index.
-        End tensors have either 'l' or 'r' dropped from the string.
+        String specifying layout of *input* arrays. E.g. 'lrp' (the
+        default) indicates the shape corresponds left-bond, right-bond,
+        'up' physical index, 'down' physical index. End tensors have either
+        'l' or 'r' dropped from the string. The arrays will be permuted to
+        'lrud' order.
     tags : str or sequence of str, optional
         Global tags to attach to all tensors.
     upper_ind_id : str
@@ -3757,31 +3914,44 @@ class MatrixProductOperator(TensorNetwork1DOperator, TensorNetwork1DFlat):
         self._site_tag_id = site_tag_id
         self.cyclic = ops.ndim(arrays[0]) == 4
 
-        # this is the perm needed to bring the arrays from
-        # their current `shape`, to the desired 'lrud' order
-        lrud_order = tuple(map(shape.find, "lrud"))
-
         tensors = []
         tags = tags_to_oset(tags)
         bonds = [rand_uuid() for _ in range(num_sites)]
+        # account for cyclic case
         bonds.append(bonds[0])
 
         for i, (site, array) in enumerate(zip(sites, arrays)):
             inds = []
 
-            if (i == 0) and not self.cyclic:
+            if L == 1:
+                # only one site
+                if self.cyclic:
+                    # bond is a self loop on the single tensor
+                    shape_desired = "lrud"
+                    inds.append(bonds[i])
+                    inds.append(bonds[i])
+                    # XXX: should we just trace it out instead?
+                else:
+                    # no bonds, just physical indices
+                    shape_desired = "ud"
+            elif (i == 0) and not self.cyclic:
                 # only right bond
-                order = tuple(shape.replace("l", "").find(x) for x in "rud")
+                shape_desired = "rud"
                 inds.append(bonds[i + 1])
             elif (i == num_sites - 1) and not self.cyclic:
                 # only left bond
-                order = tuple(shape.replace("r", "").find(x) for x in "lud")
+                shape_desired = "lud"
                 inds.append(bonds[i])
             else:
-                order = lrud_order
+                shape_desired = "lrud"
                 # both bonds
                 inds.append(bonds[i])
                 inds.append(bonds[i + 1])
+
+            # this is the perm needed to bring the arrays from
+            # their current `shape`, to the desired 'lrud' order
+            shape_given = [x for x in shape if x in shape_desired]
+            order = [shape_given.index(x) for x in shape_desired]
 
             # physical indices
             inds.append(upper_ind_id.format(site))
@@ -3833,10 +4003,11 @@ class MatrixProductOperator(TensorNetwork1DOperator, TensorNetwork1DFlat):
         cyclic : bool, optional
             Whether the MPO should be cyclic (periodic).
         shape : str, optional
-            String specifying layout of the tensors. E.g. 'lrud' (the default)
-            indicates the shape corresponds left-bond, right-bond, 'up'
-            physical index, 'down' physical index. End tensors have either
-            'l' or 'r' dropped from the string.
+            String specifying layout of *input* arrays. E.g. 'lrp' (the
+            default) indicates the shape corresponds left-bond, right-bond,
+            'up' physical index, 'down' physical index. End tensors have either
+            'l' or 'r' dropped from the string. The arrays will be permuted to
+            'lrud' order.
         tags : str or sequence of str, optional
             Global tags to attach to all tensors.
         upper_ind_id : str
@@ -4202,9 +4373,11 @@ class MatrixProductOperator(TensorNetwork1DOperator, TensorNetwork1DFlat):
         Parameters
         ----------
         shape : str, optional
-            A permutation of ``'lrud'`` specifying the desired order of the
+            A permutation of ``'lrud'`` specifying the *desired* order of the
             left, right, upper and lower (down) indices respectively.
         """
+        self.ensure_bonds_exist()
+
         for i in self.gen_sites_present():
             inds = {"u": self.upper_ind(i), "d": self.lower_ind(i)}
             if self.cyclic or i > 0:

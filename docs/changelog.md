@@ -2,13 +2,68 @@
 
 Release notes for `quimb`.
 
-(whats-new-1-10-1)=
-## v1.10.1 (unreleased)
+(whats-new-1-11-3)=
+## v1.12.0 (unreleased)
+
+**Enhancements:**
+
+- add new example on tracing tensor network functions {ref}`ex_tracing_tn_functions`
+- update infrastructure for TEBD and SimpleUpdate based algorithms.
+- [`schematic.Drawing`](quimb.schematic.drawing): add [`grid`](quimb.schematic.drawing.grid), [`grid3d`](quimb.schematic.drawing.grid3d), [`bezier`](quimb.schematic.drawing.bezier), [`star`](quimb.schematic.drawing.star), [`cross`](quimb.schematic.drawing.cross) and [`zigzag`](quimb.schematic.drawing.zigzag) methods.
+- [`schematic.Drawing`](quimb.schematic.drawing): add `relative` option to [`arrowhead`](quimb.schematic.drawing.arrowhead), `shorten` option to [`text_between`](quimb.schematic.drawing.text_between) and `text_left` and `text_right` options to [`line`](quimb.schematic.drawing.line).
+- refactor [`TEBDGen`](quimb.tensor.tensor_arbgeom_tebd.TEBDGen) and [`SimpleUpdateGen`](quimb.tensor.tensor_arbgeom_tebd.SimpleUpdateGen)
+- [`tn.draw()`](quimb.tensor.drawing.draw_tn): show abelian signature if using `symmray` arrays.
+- [`TNOptimizer`](quimb.tensor.optimize.TNOptimizer): allow `autodiff_backend="torch"` with `jit_fn=True` to work with array backends with general pytree parameters, e.g. `symmray` arrays.
+
+**Bug fixes:**
+
+- fix [`insert_compressor_between_regions`](quimb.tensor.tensor_core.TensorNetwork.insert_compressor_between_regions) when `insert_into is None`.
+
+
+(whats-new-1-11-2)=
+## v1.11.2 (2025-07-30)
+
+**Enhancements:**
+
+- Update the introduction to tensor contraction docs
+- Improve efficiency of 1D structured contractions when default `optimize` is used, especially for large bond dimension overlaps.
+
+**Bug fixes:**
+
+- fixes for MPS and MPO constructors when L=1, ({issue}`314`)
+- tensor splitting with absorb="left" now correctly marks left indices.
+- [`tn.isel`](quimb.tensor.tensor_core.TensorNetwork.isel): fix bug when value could not be compared to string `"r"`
+- truncated svd, make n_chi comparison more robust to different backends
+
+
+(whats-new-1-11-1)=
+## v1.11.1 (2025-06-20)
+
+**Enhancements:**
+
+- add `create_bond` to [`tensor_canonize_bond`](quimb.tensor.tensor_core.tensor_canonize_bond) and [`tensor_compress_bond`](quimb.tensor.tensor_core.tensor_compress_bond) for optionally creating a new bond between two tensors if they don't already share one. Add as a flag to [`TensorNetwork1DFlat.compress`](quimb.tensor.tensor_1d.TensorNetwork1DFlat.compress) and related functions ({issue}`294`).
+- add [`ensure_bonds_exist`](quimb.tensor.tensor_1d.TensorNetwork1DFlat.ensure_bonds_exist) for ensuring that all bonds in a 1D flat tensor network exist. Use this in the `permute_arrays` methods and optionally in the `expand_bond_dimension` method.
+- [`tn.draw()`](quimb.tensor.drawing.draw_tn): permit empty network, and allow `color=True` to automatically color all tags.
+- [`tn.add_tag`](quimb.tensor.tensor_core.TensorNetwork.add_tag): add a `record: Optional[dict]` kwarg, to allow for easy rewinding of temporary tags without tracking the actual networks.
+- add [`qu.plot`](quimb.utils_plot.plot) as a quick wrapper for calling `matplotlib.pyplot.plot` with the `quimb` style.
+- [`quimb.schematic`](quimb.schematic): add `zorder_delta` kwarg for fine adjustments to layering of objects in approximately the same position.
+- [`operatorbuilder`](quimb.experimental.operatorbuilder): big performance improvements and fixes for building matrix representations including Z2 symmetry. Add default `symmetry` and `sector` options that can be overridden at build time. Add lazy (slow, matrix free) 'apply' method. Add `pauli_decompose` transformation. Add experimental PEPO builder for nearest neighbor operators. Add unit tests.
+
+**Bug fixes:**
+
+- Fix [`TensorNetwork2D.compute_plaquette_environments`](quimb.tensor.tensor_2d.TensorNetwork2D.compute_plaquette_environments) for `mode="zipup"` and other boundary contraction methods that use the generic 1D compression algorithms.
+- [`parse_openqasm2_str`](quimb.tensor.circuit.parse_openqasm2_str) allow custom gate names to start with the word `gate` ({issue}`312`).
+- [`MatrixProductState.gate_with_mpo`](quimb.tensor.tensor_1d.MatrixProductState.gate_with_mpo): fix bug to do with inplace argument ({issue}`313`).
+
+
+(whats-new-1-11-0)=
+## v1.11.0 (2025-05-14)
 
 **Breaking Changes**
 
 - move belief propagation to [`quimb.tensor.belief_propagation`](quimb.tensor.belief_propagation)
 - calling [`tn.contract()`](quimb.tensor.tensor_core.TensorNetwork.contract) when an non-zero value has been accrued into `tn.exponent` now automatically re-absorbs that exponent.
+- binary tensor operations that would previously have errored now will align and broadcast
 
 **Enhancements:**
 
@@ -23,10 +78,23 @@ Release notes for `quimb`.
 - add `info` option to [`tn.gauge_all_simple`](quimb.tensor.tensor_core.TensorNetwork.gauge_all_simple) for tracking extra information such as number of iterations and max gauge diffs
 - [`Tensor.gate`](quimb.tensor.tensor_core.Tensor.gate): add `transposed` option
 - [`TensorNetwork.contract`](quimb.tensor.tensor_core.TensorNetwork.contract): add `strip_exponent` option for return the mantissa and exponent (log10) separately. Compatible with [`contract_tags`](quimb.tensor.tensor_core.TensorNetwork.contract_tags), [`contract_cumulative`](quimb.tensor.tensor_core.TensorNetwork.contract_cumulative), [`contract_compressed`](quimb.tensor.tensor_core.TensorNetwork.contract_compressed) sub modes.
+- [`tensor_split`](quimb.tensor.tensor_core.tensor_split): add `matrix_svals` option, if `True` any returned singular values are put into the diagonal of a matrix (by default, `False`, they are returned as a vector).
+- add [`Tensor.new_ind_pair_diag`](quimb.tensor.tensor_core.Tensor.new_ind_pair_diag) for expanding an existing index into a pair of new indices, such that the diagonal of the new tensor on those indices is the old tensor.
+- [`TNOptimizer`](quimb.tensor.optimize.TNOptimizer): add 'cautious' ADAM
+- [`TensorNetwork.pop_tensor`](quimb.tensor.tensor_core.TensorNetwork.pop_tensor): allow `tid` or tags to be specified.
+- add an example notebook for converting hyper tensor networks to normal tensor networks, for approximate contraction - {ref}`example-htn-to-2d`
+- add "SX" and "SXDG" gates to [`Circuit`](quimb.tensor.circuit.Circuit) ({pull}`#277`)
+- add "XXPLUSYY" and "XXPLUSYY" gates to [`Circuit`](quimb.tensor.circuit.Circuit) ({pull}`#279`)
+- add progress bar to various `Circuit` methods ({pull}`#288`)
+- [`quimb.experimental.operatorbuilder`](quimb.experimental.operatorbuilder): fix MPO building for congested operators ({issue}`296` and {issue}`301`), allow arbitrary dtype ({issue}`289`). Fix building of sparse and matrix representations for non-translationally symmetric operators and operators with trivial (all identity) terms.
 
 **Bug fixes:**
 
 - fix [`MatrixProductState.measure`](quimb.tensor.tensor_1d.MatrixProductState.measure) for `cupy` backend arrays ({issue}`276`).
+- fix `linalg.expm` dispatch ({issue}`275`)
+- fix 'dm' 1d compress method for disconnected subgraphs
+- fix docs source lookup in `quimb.tensor` module
+- fix raw gate copying in `Circuit` ({issue}`285`)
 
 
 (whats-new-1-10-0)=

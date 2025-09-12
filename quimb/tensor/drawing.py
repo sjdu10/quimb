@@ -1,5 +1,5 @@
-"""Functionailty for drawing tensor networks.
-"""
+"""Functionailty for drawing tensor networks."""
+
 import collections
 import importlib
 import textwrap
@@ -71,9 +71,9 @@ def draw_tn(
 
     Parameters
     ----------
-    color : sequence of tags, optional
-        If given, uniquely color any tensors which have each of the tags.
-        If some tensors have more than of the tags, only one color will show.
+    color : sequence of tags or True, optional
+        If given, color all tensor with each of these tags with a unique color.
+        If `True`, do this for all tags in the tensor network.
     output_inds : sequence of str, optional
         For hyper tensor networks explicitly specify which indices should be
         drawn as outer indices. If not set, the outer indices are assumed to be
@@ -266,6 +266,10 @@ def draw_tn(
         label_color = mpl.rcParams["axes.labelcolor"]
 
     # get colors for tagged nodes
+    if color is True:
+        # color all tags automatically
+        color = tuple(tn.tag_map.keys())
+
     colors = get_colors(color, custom_colors, node_alpha)
 
     if legend == "auto":
@@ -375,25 +379,43 @@ def draw_tn(
                 # dummy hyper outer edge - no arrows
                 edges[pair]["arrow_left"].append(False)
                 edges[pair]["arrow_right"].append(False)
+                edges[pair]["label_left"].append(None)
+                edges[pair]["label_right"].append(None)
             else:
                 # tensor side can always have an incoming arrow
-                tl_left_inds = tn.tensor_map[pair[0]].left_inds
+                tl = tn.tensor_map[pair[0]]
+                tl_left_inds = tl.left_inds
                 edges[pair]["arrow_left"].append(
                     show_left_inds
                     and (tl_left_inds is not None)
                     and (ix in tl_left_inds)
                 )
+
+                if hasattr(tl.data, "signature"):
+                    sigl = tl.data.signature[tl.inds.index(ix)]
+                    edges[pair]["label_left"].append(sigl)
+                else:
+                    edges[pair]["label_left"].append(None)
+
                 if ishyper:
                     # hyper edge can't have an incoming arrow
                     edges[pair]["arrow_right"].append(False)
+                    edges[pair]["label_right"].append(None)
                 else:
                     # standard edge can
-                    tr_left_inds = tn.tensor_map[pair[1]].left_inds
+                    tr = tn.tensor_map[pair[1]]
+                    tr_left_inds = tr.left_inds
                     edges[pair]["arrow_right"].append(
                         show_left_inds
                         and (tr_left_inds is not None)
                         and (ix in tr_left_inds)
                     )
+
+                    if hasattr(tr.data, "signature"):
+                        sigr = tr.data.signature[tr.inds.index(ix)]
+                        edges[pair]["label_right"].append(sigr)
+                    else:
+                        edges[pair]["label_right"].append(None)
 
     # parse all tensors / nodes
     for tid, t in tn.tensor_map.items():
@@ -475,26 +497,32 @@ def draw_tn(
     else:
         pos = _normalize_positions(pos)
 
-    # compute a base size using the position and number of tensors
-    # first get plot volume:
-    node_packing_factor = tn.num_tensors**-0.45
-    xs, ys, *zs = zip(*pos.values())
-    xmin, xmax = min(xs), max(xs)
-    ymin, ymax = min(ys), max(ys)
-    # if there only a few tensors we don't want to limit the node size
-    # because of flatness, also don't allow the plot volume to go to zero
-    xrange = max(((xmax - xmin) / 2, node_packing_factor, 0.1))
-    yrange = max(((ymax - ymin) / 2, node_packing_factor, 0.1))
-    plot_volume = xrange * yrange
-    if zs:
-        zmin, zmax = min(zs[0]), max(zs[0])
-        zrange = max(((zmax - zmin) / 2, node_packing_factor, 0.1))
-        plot_volume *= zrange
-    # in total we account for:
-    #     - user specified scaling
-    #     - number of tensors
-    #     - how flat the plot area is (flatter requires smaller nodes)
-    full_node_scale = 0.2 * node_scale * node_packing_factor * plot_volume**0.5
+    if tn.num_tensors > 0:
+        # compute a base size using the position and number of tensors
+        # first get plot volume:
+        node_packing_factor = tn.num_tensors**-0.45
+        xs, ys, *zs = zip(*pos.values())
+        xmin, xmax = min(xs), max(xs)
+        ymin, ymax = min(ys), max(ys)
+        # if there only a few tensors we don't want to limit the node size
+        # because of flatness, also don't allow the plot volume to go to zero
+        xrange = max(((xmax - xmin) / 2, node_packing_factor, 0.1))
+        yrange = max(((ymax - ymin) / 2, node_packing_factor, 0.1))
+        plot_volume = xrange * yrange
+        if zs:
+            zmin, zmax = min(zs[0]), max(zs[0])
+            zrange = max(((zmax - zmin) / 2, node_packing_factor, 0.1))
+            plot_volume *= zrange
+        # in total we account for:
+        #     - user specified scaling
+        #     - number of tensors
+        #     - how flat the plot area is (flatter requires smaller nodes)
+        full_node_scale = (
+            0.2 * node_scale * node_packing_factor * plot_volume**0.5
+        )
+
+    else:
+        full_node_scale = 1.0
 
     default_outline_size = 6 * full_node_scale**0.5
 
@@ -509,7 +537,11 @@ def draw_tn(
         nodes[node]["coo"] = G.nodes[node]["coo"] = pos[node]
 
     for (i, j), edge_data in edges.items():
-        edges[i, j]["coos"] = G.edges[i, j]["coos"] = pos[i], pos[j]
+        edge_data["coos"] = G.edges[i, j]["coos"] = pos[i], pos[j]
+        edge_data["shorten"] = G.edges[i, j]["shorten"] = (
+            nodes[i]["size"],
+            nodes[j]["size"],
+        )
 
     if get == "pos":
         return pos
@@ -667,13 +699,13 @@ def _draw_matplotlib(
         fig = None
 
     arrow_opts = arrow_opts or {}
-    arrow_opts.setdefault("center", 3 / 4)
+    arrow_opts.setdefault("center", 0.8)
     arrow_opts.setdefault("linewidth", 1)
     arrow_opts.setdefault("width", 0.08)
     arrow_opts.setdefault("length", 0.12)
 
     if title is not None:
-        ax.set_title(str(title))
+        ax.set_title(str(title), color=label_color)
 
     for _, edge_data in edges.items():
         cooa, coob = edge_data["coos"]
@@ -682,7 +714,10 @@ def _draw_matplotlib(
         labels = edge_data["label"]
         arrow_lefts = edge_data["arrow_left"]
         arrow_rights = edge_data["arrow_right"]
+        label_lefts = edge_data["label_left"]
+        label_rights = edge_data["label_right"]
         multiplicity = len(edge_colors)
+        shorten = edge_data["shorten"]
 
         if multiplicity > 1:
             offsets = np.linspace(
@@ -721,11 +756,25 @@ def _draw_matplotlib(
                     color=edge_data["label_color"],
                     fontfamily=edge_data["label_fontfamily"],
                 )
+            if label_lefts[m]:
+                line_opts["text_left"] = dict(
+                    text=label_lefts[m],
+                    fontsize=edge_data["label_fontsize"] + 3,
+                    color=edge_data["label_color"],
+                    fontfamily=edge_data["label_fontfamily"],
+                )
+            if label_rights[m]:
+                line_opts["text_right"] = dict(
+                    text=label_rights[m],
+                    fontsize=edge_data["label_fontsize"] + 3,
+                    color=edge_data["label_color"],
+                    fontfamily=edge_data["label_fontfamily"],
+                )
 
             if multiplicity > 1:
                 d.line_offset(offset=offsets[m], **line_opts)
             else:
-                d.line(**line_opts)
+                d.line(shorten=shorten, **line_opts)
 
     # draw the tensors
     for _, node_data in nodes.items():
