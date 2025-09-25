@@ -30,13 +30,11 @@ from .array_ops import isblocksparse, isfermionic
 # some convenience functions for multiplying diagonals
 
 
-@compose
 def rdmul(x, d):
     """Right-multiplication a matrix by a vector representing a diagonal."""
     return x * d[None, :]
 
 
-@compose
 def rddiv(x, d):
     """Right-multiplication of a matrix by a vector representing an inverse
     diagonal.
@@ -44,13 +42,11 @@ def rddiv(x, d):
     return x / d[None, :]
 
 
-@compose
 def ldmul(d, x):
     """Left-multiplication a matrix by a vector representing a diagonal."""
     return x * d[:, None]
 
 
-@compose
 def lddiv(d, x):
     """Left-multiplication of a matrix by a vector representing an inverse
     diagonal.
@@ -65,22 +61,22 @@ def dag_numba(x):
 
 @njit  # pragma: no cover
 def rdmul_numba(x, d):
-    return x * d[None, :]
+    return x * d.reshape(1, -1)
 
 
 @njit  # pragma: no cover
 def rddiv_numba(x, d):
-    return x / d[None, :]
+    return x / d.reshape(1, -1)
 
 
 @njit  # pragma: no cover
 def ldmul_numba(d, x):
-    return x * d[:, None]
+    return x * d.reshape(-1, 1)
 
 
 @njit  # pragma: no cover
 def lddiv_numba(d, x):
-    return x / d[:, None]
+    return x / d.reshape(-1, 1)
 
 
 @compose
@@ -155,8 +151,6 @@ def _trim_and_renorm_svd_result(
         # assume already all positive
         sabs = s
 
-    d = do("shape", sabs)[0]
-
     if (cutoff > 0.0) or (renorm > 0):
         if cutoff_mode == 1:  # 'abs'
             n_chi = do("count_nonzero", sabs > cutoff)
@@ -190,9 +184,9 @@ def _trim_and_renorm_svd_result(
         n_chi = max_bond
     else:
         # neither maximum bond dimension nor cutoff specified
-        n_chi = d
+        n_chi = do("shape", s)[0]
 
-    if n_chi < d:
+    if n_chi < do("shape", s)[0]:
         s = s[:n_chi]
         U = U[:, :n_chi]
         VH = VH[:n_chi, :]
@@ -589,21 +583,14 @@ def eigh_truncated(
     max_bond=-1,
     absorb=0,
     renorm=0,
-    positive=0,
     backend=None,
 ):
     with backend_like(backend):
         s, U = do("linalg.eigh", x)
 
         # make sure largest singular value first
-        if not positive:
-            idx = do("argsort", -do("abs", s))
-            s, U = s[idx], U[:, idx]
-        else:
-            # assume all positive, simply reverse
-            s = s[::-1]
-            U = U[:, ::-1]
-
+        idx = do("argsort", -do("abs", s))
+        s, U = s[idx], U[:, idx]
         VH = dag(U)
 
         # XXX: better to absorb phase in V and return positive 'values'?
@@ -626,13 +613,7 @@ def eigh_truncated(
 @eigh_truncated.register("numpy")
 @njit  # pragma: no cover
 def eigh_truncated_numba(
-    x,
-    cutoff=-1.0,
-    cutoff_mode=4,
-    max_bond=-1,
-    absorb=0,
-    renorm=0,
-    positive=0,
+    x, cutoff=-1.0, cutoff_mode=4, max_bond=-1, absorb=0, renorm=0
 ):
     """SVD-decomposition, using hermitian eigen-decomposition, only works if
     ``x`` is hermitian.
@@ -640,12 +621,8 @@ def eigh_truncated_numba(
     s, U = np.linalg.eigh(x)
 
     # make sure largest singular value first
-    if not positive:
-        k = np.argsort(-np.abs(s))
-        s, U = s[k], U[:, k]
-    else:
-        s = s[::-1]
-        U = U[:, ::-1]
+    k = np.argsort(-np.abs(s))
+    s, U = s[k], U[:, k]
     VH = dag_numba(U)
 
     # XXX: better to absorb phase in V and return positive 'values'?
@@ -1233,40 +1210,47 @@ def squared_op_to_reduced_factor(x2, dl, dr, right=True):
             # know exactly low-rank, so truncate
             keep = dl
         else:
-            keep = -1
+            keep = None
     else:
         if dl > dr:
             # know exactly low-rank, so truncate
             keep = dr
         else:
-            keep = -1
+            keep = None
 
     try:
         # attempt faster hermitian eigendecomposition
-        U, s2, VH = eigh_truncated(
-            x2,
-            max_bond=keep,
-            cutoff=0.0,
-            absorb=None,
-            positive=1,  # know positive
-        )
+        s2, W = do("linalg.eigh", x2)
+
+        if keep is not None:
+            # outer dimension smaller -> exactly low-rank
+            s2 = s2[-keep:]
+            W = W[:, -keep:]
+
         # might have negative eigenvalues due to numerical error from squaring
         s2 = do("clip", s2, 0.0, None)
+        s = do("sqrt", s2)
+
+        if right:
+            factor = ldmul(s, dag(W))
+        else:  # 'left'
+            factor = rdmul(W, s)
 
     except Exception:
-        # fallback to SVD if maybe badly conditioned etc.
-        U, s2, VH = svd_truncated(
-            x2,
-            max_bond=keep,
-            cutoff=0.0,
-            absorb=None,
-        )
-
-    s = do("sqrt", s2)
-    if right:
-        factor = ldmul(s, VH)
-    else:  # 'left'
-        factor = rdmul(U, s)
+        # fallback to SVD
+        U, s2, VH = do("linalg.svd", x2)
+        if keep is not None:
+            # outer dimension smaller -> exactly low-rank
+            s2 = s2[:keep]
+            if right:
+                VH = VH[:keep, :]
+            else:
+                U = U[:, :keep]
+        s = do("sqrt", s2)
+        if right:
+            factor = ldmul(s, VH)
+        else:  # 'left'
+            factor = rdmul(U, s)
 
     return factor
 
@@ -1372,6 +1356,96 @@ def compute_oblique_projectors(
     elif absorb == 1:
         Pl = Rr @ rddiv(dag(VHt), st)
         Pr = dag(Ut) @ Rl
+    else:
+        raise ValueError(f"Unrecognized absorb={absorb}.")
+
+    return Pl, Pr
+
+def compute_oblique_projectors_fermion(
+    Rl, Rr, max_bond, cutoff, absorb="both", cutoff_mode=4, **compress_opts
+):
+    """Compute the oblique projectors for two reduced factor matrices that
+    describe a gauge on a bond. Concretely, assuming that ``Rl`` and ``Rr`` are
+    the reduced factor matrices for local operator ``A``, such that:
+
+    .. math::
+
+        A = Q_L R_L R_R Q_R
+
+    with ``Q_L`` and ``Q_R`` isometric matrices, then the optimal inner
+    truncation is given by:
+
+    .. math::
+
+        A' = Q_L P_L P_R' Q_R
+
+    Parameters
+    ----------
+    Rl : array
+        The left reduced factor matrix.
+    Rr : array
+        The right reduced factor matrix.
+
+    Returns
+    -------
+    Pl : array
+        The left oblique projector.
+    Pr : array
+        The right oblique projector.
+    """
+    if max_bond is None:
+        max_bond = -1
+
+    absorb = _ABSORB_MAP[absorb]
+    cutoff_mode = _CUTOFF_MODE_MAP[cutoff_mode]
+
+    Ut, st, VHt = svd_truncated(
+        Rl @ Rr,
+        max_bond=max_bond,
+        cutoff=cutoff,
+        absorb=None,
+        cutoff_mode=cutoff_mode,
+        **compress_opts,
+    )
+
+    if absorb is None:
+        # then form the 'oblique' projectors
+        st_inv = st**(-1)
+        Pl = Rr @ dag(VHt)
+        for (c0, c1) in Pl.blocks:
+            # st_sqrt_inv is a vector of the diagonal elements of a diagonal matrix
+            # so a right multiplication with a diagonal matrix is equivalent to
+            # multiplying each column of Pl by the corresponding element in st_sqrt_inv
+            # which on the algorithmic level can be done by element-wise multiplication
+            Pl.blocks[(c0, c1)] = Pl.blocks[(c0, c1)] * st_inv.blocks[c0].reshape((1, -1))
+        Pr = dag(Ut) @ Rl
+        for (c0, c1) in Pr.blocks:
+            Pr.blocks[(c0, c1)] = Pr.blocks[(c0, c1)] * st_inv.blocks[c0].reshape((-1, 1))
+        
+        return Pl, st, Pr
+
+    elif absorb == 0:
+        st_sqrt = do("sqrt", st)
+        # then form the 'oblique' projectors
+        st_sqrt_inv = st_sqrt**(-1)
+        Pl = Rr @ dag(VHt)
+        for (c0, c1) in Pl.blocks:
+            # st_sqrt_inv is a vector of the diagonal elements of a diagonal matrix
+            # so a right multiplication with a diagonal matrix is equivalent to
+            # multiplying each column of Pl by the corresponding element in st_sqrt_inv
+            # which on the algorithmic level can be done by element-wise multiplication
+            Pl.blocks[(c0, c1)] = Pl.blocks[(c0, c1)] * st_sqrt_inv.blocks[c0].reshape((1, -1))
+        Pr = dag(Ut) @ Rl
+        for (c0, c1) in Pr.blocks:
+            Pr.blocks[(c0, c1)] = Pr.blocks[(c0, c1)] * st_sqrt_inv.blocks[c0].reshape((-1, 1))
+        
+        return Pl, Pr
+
+    elif absorb == -1:
+        raise NotImplementedError("Fermionic case not implemented for absorb=-1")
+
+    elif absorb == 1:
+        raise NotImplementedError("Fermionic case not implemented for absorb=1")
     else:
         raise ValueError(f"Unrecognized absorb={absorb}.")
 
@@ -1514,7 +1588,7 @@ def compute_bondenv_projectors(
             Ek,
             absorb=None,
             max_bond=max_bond,
-            cutoff=1e-15,
+            cutoff=0,
             cutoff_mode=2,
         )
         Pl = _conj(Pl)
@@ -1710,5 +1784,979 @@ def compute_bondenv_projectors(
     else:
         # svals already absorbed on both sides, and no dynamic cutoff
         svals = None
+
+    return Pl, svals, Pr
+
+
+def compute_bondenv_projectors_fermion(
+    E,
+    max_bond,
+    cutoff=0.0,
+    absorb="both",
+    max_iterations=100,
+    tol=1e-10,
+    solver="solve",
+    solver_maxiter=4,
+    prenormalize=False,
+    condition=True,
+    enforce_pos=True,
+    pos_smudge=1e-10,
+    init="svd",
+    svd_cutoff=1e-15,
+    info=None,
+    verbose=False,
+):
+    """Given 4D environment tensor of a bond, iteratively compute projectors
+    that compress the bond dimension to `max_bond`, minimizing the distance in
+    terms of frobenius norm. If absorb!="both" and cutoff!=0.0 then a final
+    truncated SVD is also performed on the final projector pair.
+
+    N.B. This is experimental and not working for e.g. fermions yet.
+
+    Parameters
+    ----------
+    E : array
+        The 4D environment tensor of a bond. The dimensions should be arranged
+        as (ket-left, ket-right, bra-left, bra-right).
+    max_bond : int
+        The maximum bond dimension to compress to.
+    cutoff : float, optional
+        The singular value cutoff to use.
+    absorb : {'both', 'left', 'right', None}, optional
+        How to absorb the effective singular values into the tensors.
+    max_iterations : int, optional
+        The maximum number of iterations to use when fitting the projectors.
+    tol : float, optional
+        The target tolerance to reach when fitting the projectors.
+    solver : {'solve', None, str}, optional
+        The solver to use inside the fitting loop. If None will use a custom
+        conjugate gradient method. Else can be any of the iterative solvers
+        supported by ``scipy.sparse.linalg`` such as 'gmres', 'bicgstab', etc.
+    solver_maxiter : int, optional
+        The maximum number of iterations to use for the *inner* solver, i.e.
+        per fitting step, only for iterative `solver` args.
+    prenormalize : bool, optional
+        Whether to prenormalize the environment tensor such that its full
+        contraction before compression is 1. Recommended for stability when
+        the normalization does not matter.
+    condition : bool or "iso", optional
+        Whether to condition the projectors after each fitting step. If
+        ``True``, their norms will be simply matched. If ``"iso"``, then they
+        are gauged each time such that the previous tensor is isometric.
+        Recommended for stability.
+    enforce_pos : bool, optional
+        Whether to enforce the environment tensor to be positive semi-definite
+        by symmetrizing and clipping negative eigenvalues. Recommended for
+        stability.
+    pos_smudge : float, optional
+        The value to clip negative eigenvalues to when enforcing positivity,
+        relative to the largest eigenvalue.
+    init : {'svd', 'eigh', 'random', 'reduced'}, optional
+        How to initialize the compression projectors. The options are:
+
+        - 'svd': use a truncated SVD of the environment tensor with the bra
+          bond traced out.
+        - 'eigh': use a similarity compression of the environment tensor with
+          the bra bond traced out.
+        - 'random': use random projectors.
+        - 'reduced': split the environment into bra and ket parts, then
+          canonize one half left and right to get the reduced factors.
+
+    info : dict, optional
+        If provided, will store information about the fitting process here.
+        The keys 'iterations' and 'distance' will contain the final number of
+        iterations and distance reached respectively.
+
+    Returns
+    -------
+    Pl : array
+        The left projector.
+    Pr : array
+        The right projector.
+    """
+    backend = infer_backend(E)
+    _conj = get_lib_fn(backend, "conj")
+    _fuse = get_lib_fn(backend, "fuse")
+    _reshape = get_lib_fn(backend, "reshape")
+
+    absorb = _ABSORB_MAP[absorb]
+
+    if solver == "solve":
+        _solve = get_lib_fn(backend, "linalg.solve")
+        use_x0 = False
+    elif solver is None:
+        from .fitting import conjugate_gradient
+
+        _solve = conjugate_gradient
+        use_x0 = True
+        raise NotImplementedError("Fermionic case not implemented for scipy iterative solvers yet.")
+
+    blocksparse = isblocksparse(E)
+    fermionic = isfermionic(E)
+
+    if fermionic:
+        if E.indices[2].dual:
+            E = E.phase_flip(2)
+        else:
+            E = E.phase_flip(3)
+    
+    E.phase_sync(inplace=True)
+
+    if prenormalize:
+        E = E / ctg.array_contract((E,), (("K", "K", "B", "B"),), ())
+
+    if enforce_pos:
+        Ea = do("fuse", E, (0, 1), (2, 3))
+        Ea = (Ea + dag(Ea)) / 2
+        el, ev = do("linalg.eigh", Ea)
+        lmax = do("max", el)
+        for blk, ts in el.blocks.items():
+            # get the sign of the element with the maximum absolute value
+            max_abs_idx = ts.abs().argmax()
+            sign = ts[max_abs_idx].sign().item()
+            pos_ts = ts * sign
+            clipped_ts = do("clip", pos_ts + lmax * pos_smudge, lmax * pos_smudge, None)
+            signed_clipped_ts = clipped_ts * sign
+            el.blocks[blk] = signed_clipped_ts
+        Ea = do("multiply_diagonal", ev, el, axis=1) @ dag(ev)
+        E = do("reshape", Ea, E.shape)
+        # raise NotImplementedError("Fermionic case not implemented for enforce_pos=True")
+
+    # current bond dim
+    d = E.shape[0]
+    # environment with bra indices traced out (i.e. half uncompressed)
+    Ek = ctg.array_contract((E,), (("kl", "kr", "X", "X"),), ("kl", "kr"))
+    # for distance calculation, compute <A|A>, which is constant
+    yAA = do("abs", ctg.array_contract((Ek,), (("X", "X"),), ()))
+
+    # initial guess for projectors
+    if type(init) is str:
+        if init == "svd":
+            Pl, _, Pr = svd_truncated(
+                Ek,
+                absorb=None,
+                max_bond=max_bond,
+                cutoff=svd_cutoff,
+                cutoff_mode=2,
+            )
+            Pl = _conj(Pl)
+            Pr = _conj(Pr)
+            Pl.phase_sync(inplace=True)
+            Pr.phase_sync(inplace=True)
+        
+        elif init == "reduced":
+            from quimb.tensor.tensor_core import Tensor
+
+            ft = Tensor(E, ["kl", "kr", "bl", "br"])
+            # factor positive environment
+            ekt, _ = ft.split(
+                left_inds=["kl", "kr"],
+                right_inds=["bl", "br"],
+                get="tensors",
+                bond_ind="b",
+                method="svd",
+            )
+
+            # compute left reduced factor
+            Rl = ekt.compute_reduced_factor("right", ["b", "kr"], ["kl"])
+
+            # compute right reduced factor
+            Rr = ekt.compute_reduced_factor("left", ["kr"], ["kl", "b"])
+
+            Ut, st, VHt = svd_truncated(
+                Rl @ Rr,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                absorb=None,
+                cutoff_mode=4,
+            )
+            st_sqrt = do("sqrt", st)
+            # then form the 'oblique' projectors
+            st_sqrt_inv = st_sqrt**(-1)
+            Pl = Rr @ dag(VHt)
+            for (c0, c1) in Pl.blocks:
+                # st_sqrt_inv is a vector of the diagonal elements of a diagonal matrix
+                # so a right multiplication with a diagonal matrix is equivalent to
+                # multiplying each column of Pl by the corresponding element in st_sqrt_inv
+                # which on the algorithmic level can be done by element-wise multiplication
+                Pl.blocks[(c0, c1)] = Pl.blocks[(c0, c1)] * st_sqrt_inv.blocks[c0].reshape((1, -1))
+            Pr = dag(Ut) @ Rl
+            for (c0, c1) in Pr.blocks:
+                Pr.blocks[(c0, c1)] = Pr.blocks[(c0, c1)] * st_sqrt_inv.blocks[c0].reshape((-1, 1))
+            Pl.phase_sync(inplace=True)
+            Pr.phase_sync(inplace=True)
+
+        else:
+            raise ValueError(f"Unrecognized init={init}.")
+    elif type(init) is tuple:
+        Pl, Pr = init
+        Pl.phase_sync(inplace=True)
+        Pr.phase_sync(inplace=True)
+
+    def _distance(A, b, Pr=None, Pl=None):
+        if Pr is not None:
+            E_k_Pl = b
+            E_Pl = A
+            E_Pl_Pr = ctg.array_contract(
+                [E_Pl, Pr, Pr.conj()],
+                [("kl", "krX", "bl", "brX"), ("kr", "krX"), ("br", "brX")],
+                ("kl", "kr", "bl", "br"),
+            )
+            yBB = ctg.array_contract(
+                [E_Pl_Pr,],
+                [('X', 'X', 'Y', 'Y'),],
+                (),
+            )
+            E_k_Pl_Pr = ctg.array_contract(
+                [E_k_Pl, Pr],
+                [("kl", "krX"), ("kr", "krX")],
+                ("kl", "kr"),
+            )
+            yAB = ctg.array_contract(
+                [E_k_Pl_Pr,],
+                [('X', 'X'),],
+                (),
+            )
+            dis = 2 * abs(yAA + yBB - 2 * abs(yAB)) ** 0.5 / (yAA**0.5 + yBB**0.5)
+            # print(f'yAA={yAA}, yBB={yBB}, yAB={yAB}')
+            return dis
+        elif Pl is not None:
+            E_k_Pr = b
+            E_Pr = A
+            E_Pr_Pl = ctg.array_contract(
+                [E_Pr, Pl, Pl.conj()],
+                [("klX", "kr", "blX", "br"), ("klX", "kl"), ("blX", "bl")],
+                ("kl", "kr", "bl", "br"),
+            )
+            yBB = ctg.array_contract(
+                [E_Pr_Pl,],
+                [('X', 'X', 'Y', 'Y'),],
+                (),
+            )
+            E_k_Pr_Pl = ctg.array_contract(
+                [E_k_Pr, Pl],
+                [("kl", "krX"), ("kl", "klX")],
+                ("kl", "kr"),
+            )
+            yAB = ctg.array_contract(
+                [E_k_Pr_Pl,],
+                [('X', 'X'),],
+                (),
+            )
+            dis = 2 * abs(yAA + yBB - 2 * abs(yAB)) ** 0.5 / (yAA**0.5 + yBB**0.5)
+            return dis
+    
+    def _distance_proj(Pl, Pr):
+        Pl = Pl.copy()
+        Pr = Pr.copy()
+        Pr_conj = Pr.conj()
+        Pl_conj = Pl.conj()
+        Pr_conj.phase_sync(inplace=True)
+        Pl_conj.phase_sync(inplace=True)
+
+        E_Pl = ctg.array_contract(
+            [E, Pl, Pl_conj],
+            [("klX", "kr", "blX", "br"), ("klX", "kl"), ("blX", "bl")],
+            ("kl", "kr", "bl", "br"),
+        )
+        E_Pl_Pr = ctg.array_contract(
+            [E_Pl, Pr, Pr_conj],
+            [("kl", "krX", "bl", "brX"), ("kr", "krX"), ("br", "brX")],
+            ("kl", "kr", "bl", "br"),
+        )
+
+        yBB = ctg.array_contract(
+            [E_Pl_Pr,],
+            [('X', 'X', 'Y', 'Y'),],
+            (),
+        )
+
+        E_k_Pr = ctg.array_contract(
+            [Ek, Pr],
+            [("kl", "krX"), ("kr", "krX")],
+            ("kl", "kr"),
+        )
+        E_k_Pr_Pl = ctg.array_contract(
+            [E_k_Pr, Pl],
+            [("klX", "kr"), ("klX", "kl")],
+            ("kl", "kr"),
+        )
+
+        yAB = ctg.array_contract(
+            [E_k_Pr_Pl,],
+            [('X', 'X'),],
+            (),
+        )
+
+        if Pr_conj.indices[0].dual:
+            Pr_conj.phase_flip(0, inplace=True)
+
+        E_Pr = ctg.array_contract(
+            [E, Pr, Pr_conj],
+            [("kl", "krX", "bl", "brX"), ("kr", "krX"), ("br", "brX")],
+            ("kl", "kr", "bl", "br"),
+        )
+
+        E_Pr_Pl = ctg.array_contract(
+            [E_Pr, Pl, Pl_conj],
+            [("klX", "kr", "blX", "br"), ("klX", "kl"), ("blX", "bl")],
+            ("kl", "kr", "bl", "br"),
+        )
+
+        yBB1 = ctg.array_contract(
+            [E_Pr_Pl,],
+            [('X', 'X', 'Y', 'Y'),],
+            (),
+        )
+
+        dis = 2 * abs(yAA + yBB - 2 * abs(yAB)) ** 0.5 / (yAA**0.5 + yBB**0.5)
+        # print(yBB, yBB1, abs(yBB-yBB1))
+        # if abs(yBB-yBB1)>1e-5:
+        #     print("Warning: yBB from two contractions do not match!")
+        print(f'yAA={yAA}, yBB={yBB}, yBB1={yBB1}, yAB={yAB}, abs(yBB-yBB1)={abs(yBB-yBB1)}')
+
+        return dis
+    
+    def _fidelity(A, b, Pr=None, Pl=None):
+        if Pr is not None:
+            E_k_Pl = b
+            E_Pl = A
+            E_Pl_Pr = ctg.array_contract(
+                [E_Pl, Pr, Pr.conj()],
+                [("kl", "krX", "bl", "brX"), ("kr", "krX"), ("br", "brX")],
+                ("kl", "kr", "bl", "br"),
+            )
+            yBB = ctg.array_contract(
+                [E_Pl_Pr,],
+                [('X', 'X', 'Y', 'Y'),],
+                (),
+            )
+            E_k_Pl_Pr = ctg.array_contract(
+                [E_k_Pl, Pr],
+                [("kl", "krX"), ("kr", "krX")],
+                ("kl", "kr"),
+            )
+            yAB = ctg.array_contract(
+                [E_k_Pl_Pr,],
+                [('X', 'X'),],
+                (),
+            )
+            return (yAB**2 / (yBB * yAA))**0.5
+        elif Pl is not None:
+            E_k_Pr = b
+            E_Pr = A
+            E_Pr_Pl = ctg.array_contract(
+                [E_Pr, Pl, Pl.conj()],
+                [("klX", "kr", "blX", "br"), ("klX", "kl"), ("blX", "bl")],
+                ("kl", "kr", "bl", "br"),
+            )
+            yBB = ctg.array_contract(
+                [E_Pr_Pl,],
+                [('X', 'X', 'Y', 'Y'),],
+                (),
+            )
+            E_k_Pr_Pl = ctg.array_contract(
+                [E_k_Pr, Pl],
+                [("kl", "krX"), ("kl", "klX")],
+                ("kl", "kr"),
+            )
+            yAB = ctg.array_contract(
+                [E_k_Pr_Pl,],
+                [('X', 'X'),],
+                (),
+            )
+            return (yAB**2 / (yBB * yAA))**0.5
+
+    
+    def _fidelity_proj(Pl, Pr):
+        Pl = Pl.copy()
+        Pr = Pr.copy()
+        Pr_conj = Pr.conj()
+        Pl_conj = Pl.conj()
+
+        E_Pr = ctg.array_contract(
+            [E, Pr, Pr_conj],
+            [("kl", "krX", "bl", "brX"), ("kr", "krX"), ("br", "brX")],
+            ("kl", "kr", "bl", "br"),
+        )
+
+        E_Pr_Pl = ctg.array_contract(
+            [E_Pr, Pl, Pl_conj],
+            [("klX", "kr", "blX", "br"), ("klX", "kl"), ("blX", "bl")],
+            ("kl", "kr", "bl", "br"),
+        )
+
+        yBB = ctg.array_contract(
+            [E_Pr_Pl,],
+            [('X', 'X', 'Y', 'Y'),],
+            (),
+        )
+
+        E_k_Pr = ctg.array_contract(
+            [Ek, Pr],
+            [("kl", "krX"), ("kr", "krX")],
+            ("kl", "kr"),
+        )
+        E_k_Pr_Pl = ctg.array_contract(
+            [E_k_Pr, Pl],
+            [("klX", "kr"), ("klX", "kl")],
+            ("kl", "kr"),
+        )
+
+        yAB = ctg.array_contract(
+            [E_k_Pr_Pl,],
+            [('X', 'X'),],
+            (),
+        )
+        return (yAB**2 / (yBB * yAA))**0.5
+    
+    def detect_nan_in_fts(fts):
+        for sector, tensor in fts.blocks.items():
+            print(tensor)
+            if do("isnan", tensor).any():
+                return True
+        return False
+
+    
+    old_diff = None
+    new_diff = None
+
+    if use_x0:
+        xl0 = _conj(_fuse(Pl, (0, 1)))
+        xr0 = _conj(_fuse(Pr, (0, 1)))
+    else:
+        xl0 = xr0 = None
+
+    if condition == "iso":
+        Lr, _, Pr = lq_stabilized(Pr)
+        Pl = Pl @ Lr
+
+    elif condition:
+        # match projector norms
+        nrml = do("linalg.norm", Pl)
+        nrmr = do("linalg.norm", Pr)
+        Pl = Pl * (nrmr**0.5 / nrml**0.5)
+        Pr = Pr * (nrml**0.5 / nrmr**0.5)
+
+    for it in range(max_iterations):
+        
+        # solve for left projector
+        #      ┌────┐              ┌────┐
+        #          ┌┴─┐                ┌┴─┐
+        #          │Pr│                │Pr│
+        #          └┬─┘                └┬─┘
+        #     ┌┴────┴┐            ┌┴────┴┐
+        #     │  E   │   x  ?  =  │  Ek  │
+        #     └┬────┬┘            └┬────┬┘
+        #          ┌┴─┐            │    │
+        #      ?   │Pr│*           └────┘
+        #          └┬─┘
+        #      └────┘
+
+        A = ctg.array_contract(
+            [E, Pr, _conj(Pr)],
+            [("kl", "krX", "bl", "brX"), ("kr", "krX"), ("br", "brX")],
+            ("kl", "kr", "bl", "br"),
+        )
+
+        b = ctg.array_contract(
+            [Ek, Pr],
+            [("kl", "krX"), ("kr", "krX")],
+            ("kl", "kr"),
+        )
+        A.phase_sync(inplace=True)
+        b.phase_sync(inplace=True)
+
+        if blocksparse:
+            A, b = do("align_axes", A, b, axes=((0, 1), (0, 1)))
+            A, b = do("align_axes", A, b, axes=((2, 3), (0, 1)))
+
+        # get pre-fuse shape as `d` might have changed
+        Pl_shape = b.shape
+        b = _fuse(b, (0, 1))
+        A = _fuse(A, (0, 1), (2, 3))
+
+        if use_x0:
+            x = _solve(A, b, x0=xl0, maxiter=solver_maxiter)
+            xl0 = x
+        else:
+            x = _solve(A, b)
+
+        # xc = _conj(x) # x is actually the complex conjugate of Pl: Pl* 
+        # Pl = _reshape(xc, Pl_shape)
+        Plc = _reshape(x, Pl_shape)
+        Pl = _conj(Plc) # conjugate of a fermionic array: dagger + transposition back to original order
+
+        # print(f'it={it}, after reshape F={fidelity_bm}')
+        # solve for right projector
+        #      ┌────┐            ┌────┐
+        #     ┌┴─┐              ┌┴─┐
+        #     │Pl│              │Pl│
+        #     └┬─┘              └┬─┘
+        #     ┌┴─────┐          ┌┴─────┐
+        #     │  E   │  x ?  =  │  Ek  │
+        #     └┬─────┘          └┬────┬┘
+        #     ┌┴─┐               │    │
+        #     │Pl│* ?            └────┘
+        #     └┬─┘
+        #      └────┘
+        if condition == "iso":
+            Pl, _, Rl = qr_stabilized(Pl)
+            Pr = Rl @ Pr
+        elif condition:
+            # match projector norms
+            nrml = do("linalg.norm", Pl)
+            nrmr = do("linalg.norm", Pr)
+            Pl = Pl * (nrmr**0.5 / nrml**0.5)
+            Pr = Pr * (nrml**0.5 / nrmr**0.5)
+
+        A = ctg.array_contract(
+            [E, Pl, _conj(Pl)],
+            [("klX", "kr", "blX", "br"), ("klX", "kl"), ("blX", "bl")],
+            ("kl", "kr", "bl", "br"),
+        )
+
+        b = ctg.array_contract(
+            [Ek, Pl],
+            [("klX", "kr"), ("klX", "kl")],
+            ("kl", "kr"),
+        )
+        A.phase_sync(inplace=True)
+        b.phase_sync(inplace=True)
+        A0 = A.copy()
+        b0 = b.copy()
+
+        if blocksparse:
+            A, b = do("align_axes", A, b, axes=((0, 1), (0, 1)))
+            A, b = do("align_axes", A, b, axes=((2, 3), (0, 1)))
+
+        # get pre-fuse shape as `d` might have changed
+        Pr_shape = b.shape
+        b = _fuse(b, (0, 1))
+        A = _fuse(A, (0, 1), (2, 3))
+
+        if use_x0:
+            x = _solve(A, b, x0=xr0, maxiter=solver_maxiter)
+            xr0 = x
+        else:
+            x = _solve(A, b)
+
+        # Pr = _reshape(xc, Pr_shape)
+        Prc = _reshape(x, Pr_shape)
+        Pr = _conj(Prc) 
+
+        if condition == "iso":
+            Pl, _, Rl = qr_stabilized(Pl)
+            Pr = Rl @ Pr
+        elif condition:
+            # match projector norms
+            nrml = do("linalg.norm", Pl)
+            nrmr = do("linalg.norm", Pr)
+            Pl = Pl * (nrmr**0.5 / nrml**0.5)
+            Pr = Pr * (nrml**0.5 / nrmr**0.5)
+        
+
+        if (it % 10 == 0 or it == max_iterations - 1) and verbose:
+            # fidelity_proj = _fidelity_proj(Pl, Pr)
+            fidelity = _fidelity(A0, b0, Pr=Pr)
+            print(f'it={it}, F={fidelity}')
+
+        # check for convergence
+        if tol != 0.0:
+            new_diff = _distance(A0, b0, Pr=Pr)
+            # if new_diff is nan, stop
+            if do("isnan", new_diff):
+                print("NaN encountered!")
+                new_diff_proj = _distance_proj(Pl, Pr)
+                print(f'new_diff_proj={new_diff_proj}, new_diff={new_diff}')
+                # exit(0)
+
+            if old_diff is not None and abs(new_diff - old_diff) < tol:
+                break
+            old_diff = new_diff
+    
+    if verbose:
+        print(f'Total iter: {it} diff: {new_diff} \n')
+
+    if info is not None:
+        info["distance"] = new_diff
+        info["iterations"] = it + 1
+    
+
+    if not ((absorb == 0) and (cutoff == 0.0)):
+        # should/can do this on reduced factors?
+        Pl, svals, Pr = svd_truncated(
+            Pl @ Pr,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            absorb=absorb,
+        )
+    else:
+        # svals already absorbed on both sides, and no dynamic cutoff
+        svals = None
+
+    
+    # raise NotImplementedError("This function is not implemented for fermions yet.")
+    return Pl, svals, Pr
+
+
+def compute_bondenv_projectors_fermion_autodiff(
+    E,
+    max_bond,
+    cutoff=0.0,
+    absorb="both",
+    max_iterations=500,
+    tol=1e-10,
+    fidelity_tol=1e-10,
+    solver="solve",
+    solver_maxiter=4,
+    prenormalize=False,
+    condition=True,
+    enforce_pos=True,
+    pos_smudge=1e-10,
+    init="svd",
+    svd_cutoff=1e-15,
+    info=None,
+    lr=5e-3,
+    optimizer='SGD',
+    compute_fidelity_every=1,
+    log_time=False,
+):
+    """Given 4D environment tensor of a bond, iteratively compute projectors
+    that compress the bond dimension to `max_bond`, minimizing the distance in
+    terms of frobenius norm. If absorb!="both" and cutoff!=0.0 then a final
+    truncated SVD is also performed on the final projector pair.
+
+    N.B. This is experimental and not working for e.g. fermions yet.
+
+    Parameters
+    ----------
+    E : array
+        The 4D environment tensor of a bond. The dimensions should be arranged
+        as (ket-left, ket-right, bra-left, bra-right).
+    max_bond : int
+        The maximum bond dimension to compress to.
+    cutoff : float, optional
+        The singular value cutoff to use.
+    absorb : {'both', 'left', 'right', None}, optional
+        How to absorb the effective singular values into the tensors.
+    max_iterations : int, optional
+        The maximum number of iterations to use when fitting the projectors.
+    tol : float, optional
+        The target tolerance to reach when fitting the projectors.
+    fidelity_tol : float, optional
+        The target fidelity change to reach when fitting the projectors.
+    solver : {'solve', None, str}, optional
+        The solver to use inside the fitting loop. If None will use a custom
+        conjugate gradient method. Else can be any of the iterative solvers
+        supported by ``scipy.sparse.linalg`` such as 'gmres', 'bicgstab', etc.
+    solver_maxiter : int, optional
+        The maximum number of iterations to use for the *inner* solver, i.e.
+        per fitting step, only for iterative `solver` args.
+    prenormalize : bool, optional
+        Whether to prenormalize the environment tensor such that its full
+        contraction before compression is 1. Recommended for stability when
+        the normalization does not matter.
+    condition : bool or "iso", optional
+        Whether to condition the projectors after each fitting step. If
+        ``True``, their norms will be simply matched. If ``"iso"``, then they
+        are gauged each time such that the previous tensor is isometric.
+        Recommended for stability.
+    enforce_pos : bool, optional
+        Whether to enforce the environment tensor to be positive semi-definite
+        by symmetrizing and clipping negative eigenvalues. Recommended for
+        stability.
+    pos_smudge : float, optional
+        The value to clip negative eigenvalues to when enforcing positivity,
+        relative to the largest eigenvalue.
+    init : {'svd', 'eigh', 'random', 'reduced'}, optional
+        How to initialize the compression projectors. The options are:
+
+        - 'svd': use a truncated SVD of the environment tensor with the bra
+          bond traced out.
+        - 'eigh': use a similarity compression of the environment tensor with
+          the bra bond traced out.
+        - 'random': use random projectors.
+        - 'reduced': split the environment into bra and ket parts, then
+          canonize one half left and right to get the reduced factors.
+
+    info : dict, optional
+        If provided, will store information about the fitting process here.
+        The keys 'iterations' and 'distance' will contain the final number of
+        iterations and distance reached respectively.
+
+    Returns
+    -------
+    Pl : array
+        The left projector.
+    Pr : array
+        The right projector.
+    """
+    backend = infer_backend(E)
+    _conj = get_lib_fn(backend, "conj")
+    _fuse = get_lib_fn(backend, "fuse")
+    _reshape = get_lib_fn(backend, "reshape")
+
+    absorb = _ABSORB_MAP[absorb]
+
+    if solver == "solve":
+        _solve = get_lib_fn(backend, "linalg.solve")
+        use_x0 = False
+    elif solver is None:
+        from .fitting import conjugate_gradient
+
+        _solve = conjugate_gradient
+        use_x0 = True
+
+    blocksparse = isblocksparse(E)
+    fermionic = isfermionic(E)
+
+    if fermionic:
+        if E.indices[2].dual:
+            E = E.phase_flip(2)
+        else:
+            E = E.phase_flip(3)
+    
+    E.phase_sync(inplace=True)
+
+    if prenormalize:
+        E = E / ctg.array_contract((E,), (("K", "K", "B", "B"),), ())
+    
+    if enforce_pos:
+        raise NotImplementedError("Positivity enforcement is not implemented for autodiff yet.")
+        # with backend_like(backend):
+        #     Ea = do("fuse", E, (0, 1), (2, 3))
+        #     Ea = (Ea + dag(Ea)) / 2
+        #     el, ev = do("linalg.eigh", Ea)
+        #     # lmax = do("max", el)
+        #     # el = do("clip", el + lmax * pos_smudge, lmax * pos_smudge, None)
+        #     Ea = do("multiply_diagonal", ev, el, axis=1) @ dag(ev)
+        #     E = do("reshape", Ea, E.shape)
+    
+    # current bond dim
+    d = E.shape[0]
+    # environment with bra indices traced out (i.e. half uncompressed)
+    Ek = ctg.array_contract((E,), (("kl", "kr", "X", "X"),), ("kl", "kr"))
+    # for distance calculation, compute <A|A>, which is constant
+    yAA = do("abs", ctg.array_contract((Ek,), (("X", "X"),), ()))
+
+    import time
+    t0 = time.time()
+
+    # initial guess for projectors
+    if type(init) is str:
+        if init == "svd":
+            Pl, _, Pr = svd_truncated(
+                Ek,
+                absorb=None,
+                max_bond=max_bond,
+                cutoff=svd_cutoff,
+                cutoff_mode=2,
+            )
+            Pl = _conj(Pl)
+            Pr = _conj(Pr)
+            Pl.phase_sync(inplace=True)
+            Pr.phase_sync(inplace=True)
+        
+        elif init == "reduced":
+            from quimb.tensor.tensor_core import Tensor
+
+            ft = Tensor(E, ["kl", "kr", "bl", "br"])
+            # factor positive environment
+            ekt, _ = ft.split(
+                left_inds=["kl", "kr"],
+                right_inds=["bl", "br"],
+                get="tensors",
+                bond_ind="b",
+                method="svd",
+            )
+
+            # compute left reduced factor
+            Rl = ekt.compute_reduced_factor("right", ["b", "kr"], ["kl"])
+
+            # compute right reduced factor
+            Rr = ekt.compute_reduced_factor("left", ["kr"], ["kl", "b"])
+
+            Ut, st, VHt = svd_truncated(
+                Rl @ Rr,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                absorb=None,
+                cutoff_mode=4,
+            )
+            st_sqrt = do("sqrt", st)
+            # then form the 'oblique' projectors
+            st_sqrt_inv = st_sqrt**(-1)
+            Pl = Rr @ dag(VHt)
+            for (c0, c1) in Pl.blocks:
+                # st_sqrt_inv is a vector of the diagonal elements of a diagonal matrix
+                # so a right multiplication with a diagonal matrix is equivalent to
+                # multiplying each column of Pl by the corresponding element in st_sqrt_inv
+                # which on the algorithmic level can be done by element-wise multiplication
+                Pl.blocks[(c0, c1)] = Pl.blocks[(c0, c1)] * st_sqrt_inv.blocks[c0].reshape((1, -1))
+            Pr = dag(Ut) @ Rl
+            for (c0, c1) in Pr.blocks:
+                Pr.blocks[(c0, c1)] = Pr.blocks[(c0, c1)] * st_sqrt_inv.blocks[c0].reshape((-1, 1))
+
+        else:
+            raise ValueError(f"Unrecognized init={init}.")
+    elif type(init) is tuple:
+        Pl, Pr = init
+    
+    
+    t1 = time.time()
+    if log_time:
+        print(f'Initialization took {t1-t0} seconds.')
+    def _distance(xc, x, A, b):
+        yAB = (xc @ b).real
+        yBB = abs(xc @ (A @ x))
+        return 2 * (yAA + yBB - 2 * yAB) ** 0.5 / (yAA**0.5 + yBB**0.5)
+    
+    def _fidelity(xc, x, A, b):
+        psi_AB = abs(xc @ b)
+        psi_BB = abs(xc @ (A @ x))
+        return psi_AB**2 / (psi_BB * yAA)
+    
+    
+    def fidelity_loss(Pl, Pr):
+        Pl = Pl.copy()
+        Pr = Pr.copy()
+        Pr_conj = Pr.conj()
+        Pl_conj = Pl.conj()
+
+        E_Pr = ctg.array_contract(
+            [E, Pr, Pr_conj],
+            [("kl", "krX", "bl", "brX"), ("kr", "krX"), ("br", "brX")],
+            ("kl", "kr", "bl", "br"),
+        )
+
+        E_Pr_Pl = ctg.array_contract(
+            [E_Pr, Pl, Pl_conj],
+            [("klX", "kr", "blX", "br"), ("klX", "kl"), ("blX", "bl")],
+            ("kl", "kr", "bl", "br"),
+        )
+
+        yBB = ctg.array_contract(
+            [E_Pr_Pl,],
+            [('X', 'X', 'Y', 'Y'),],
+            (),
+        )
+
+        E_k_Pr = ctg.array_contract(
+            [Ek, Pr],
+            [("kl", "krX"), ("kr", "krX")],
+            ("kl", "kr"),
+        )
+        E_k_Pr_Pl = ctg.array_contract(
+            [E_k_Pr, Pl],
+            [("klX", "kr"), ("klX", "kl")],
+            ("kl", "kr"),
+        )
+
+        yAB = ctg.array_contract(
+            [E_k_Pr_Pl,],
+            [('X', 'X'),],
+            (),
+        )
+        return -torch.log(yAB**2 / (yBB * yAA))
+    
+    import torch
+
+    def clear_grad(x):
+        """Clear the gradient of a tensor."""
+        if x.grad is not None:
+            x.grad.zero_()
+        return x
+    
+    def update_x(x):
+        if x.grad is not None:
+            x = x - x.grad * lr  # simple gradient descent step
+        return x
+    
+    E.apply_to_arrays(lambda x: x.detach().requires_grad_(False))
+    Ek.apply_to_arrays(lambda x: x.detach().requires_grad_(False))
+
+    all_params = []
+    def prepare_params(tensors):
+        """
+        Function to detach, set requires_grad=True, and collect parameters.
+        This replaces the apply_to_arrays(lambda x: x.detach().requires_grad_(True)) call.
+        """
+        params = []
+        def to_param(x):
+            nonlocal params
+            x_param = x.detach().requires_grad_(True)
+            params.append(x_param)
+            return x_param
+        tensors.apply_to_arrays(to_param)
+        return params
+    
+    # Prepare the tensors for optimization
+    all_params.extend(prepare_params(Pl))
+    all_params.extend(prepare_params(Pr))
+
+    # Initialize the Adam optimizer with the parameters you want to optimize
+    # Pass the list of all parameters (tensors with requires_grad=True) to the optimizer.
+    if optimizer == 'SGD':
+        optimizer = torch.optim.SGD(all_params, lr=lr, momentum=0.9, dampening=0.0)
+    elif optimizer == 'Adam':
+        optimizer = torch.optim.Adam(all_params, lr=lr)
+
+    F_p0 = -1
+    for it in range(max_iterations):
+        # Use optimizer.zero_grad() to clear gradients from the previous step.
+        optimizer.zero_grad()
+
+        if condition:
+            # match projector norms
+            nrml = do("linalg.norm", Pl)
+            nrmr = do("linalg.norm", Pr)
+            Pl1 = Pl * (nrmr**0.5 / nrml**0.5)
+            Pr1 = Pr * (nrml**0.5 / nrmr**0.5)
+        else:
+            Pl1 = Pl
+            Pr1 = Pr
+
+        # Calculate the loss (forward pass)
+        F_p = fidelity_loss(Pl1, Pr1)
+        
+        # Perform the backward pass to compute gradients
+        F_p.backward()
+
+        # Use optimizer.step() to update the parameters.
+        optimizer.step()
+
+        # Optional: Print loss to monitor progress
+        if compute_fidelity_every is not None:
+            if it % compute_fidelity_every == 0:
+                print(f"Iteration {it}, Loss: {F_p.item():.6f}, Fidelity: {torch.exp(-F_p).item()**0.5:.6f}")
+        
+        # consider early stopping based on the loss change
+        if abs(F_p.item() - F_p0) < fidelity_tol:
+            break
+        F_p0 = F_p.item()
+
+    t2 = time.time()
+    if log_time:
+        print(f'Optimization took {t2-t1} seconds for {it+1} iterations.')
+
+    optimizer.zero_grad()  # Clear gradients after the last step
+
+    if info is not None:
+        info["distance"] = F_p.item()
+        info["iterations"] = it + 1
+
+    with torch.no_grad():
+        if not ((absorb == 0) and (cutoff == 0.0)):
+            # should/can do this on reduced factors?
+            Pl, svals, Pr = svd_truncated(
+                Pl @ Pr,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                absorb=absorb,
+            )
+        else:
+            # svals already absorbed on both sides, and no dynamic cutoff
+            svals = None
 
     return Pl, svals, Pr
