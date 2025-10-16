@@ -1319,17 +1319,21 @@ class TensorNetwork3D(TensorNetworkGen):
         contract_boundary_opts["compress_opts"] = compress_opts
 
         if mode == "peps":
-            return tn._contract_boundary_core(**contract_boundary_opts)
+            tn._contract_boundary_core(**contract_boundary_opts)
+            return tn
 
         if mode == "l2bp3d":
-            return tn._contract_boundary_l2bp(**contract_boundary_opts)
+            tn._contract_boundary_l2bp(**contract_boundary_opts)
+            return tn
 
         if mode == "projector3d":
-            return tn._contract_boundary_projector(**contract_boundary_opts)
+            tn._contract_boundary_projector(**contract_boundary_opts)
+            return tn
 
-        return tn._contract_boundary_core_via_2d(
+        tn._contract_boundary_core_via_2d(
             method=mode, **contract_boundary_opts
         )
+        return tn
 
     contract_boundary_from_ = functools.partialmethod(
         contract_boundary_from, inplace=True
