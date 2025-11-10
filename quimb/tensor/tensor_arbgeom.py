@@ -1533,6 +1533,7 @@ class TensorNetworkGenVector(TensorNetworkGen):
         smudge=1e-12,
         power=1.0,
         info=None,
+        track_norm=False,
         **gate_opts,
     ):
         """Apply a gate to this vector tensor network at sites ``where``, using
@@ -1591,7 +1592,10 @@ class TensorNetworkGenVector(TensorNetworkGen):
             # inner ungauging is performed by tracking the new singular values
             (((_, ix), s),) = info.items()
             if renorm:
-                s = s / do("linalg.norm", s)
+                s_norm = do("linalg.norm", s)
+                s = s / s_norm
+                if track_norm:
+                    self.exponent = self.exponent + do('log10', s_norm)
             gauges[ix] = s
 
         return self
