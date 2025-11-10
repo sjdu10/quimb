@@ -32,13 +32,17 @@ class Drawing:
         A factor to scale the y-axis by.
     zscale : float
         A factor to scale the z-axis by.
-    presets : dict
+    presets : dict[str, dict], optional
         A dictionary of named style presets. When you add an element to the
         drawing, you can specify a preset name to use as default styling.
     ax : matplotlib.axes.Axes
         The axes to draw on. If None, a new figure is created. If an external
         `ax` is supplied, then note that this `Drawing` instance will not
         automatically adjust the limits of the axes as elements are added.
+    adjust_lims : bool or "auto", optional
+        Whether to automatically adjust the axes limits as elements are added.
+        If "auto" (the default), then this is ``True`` if ``ax`` is None, else
+        ``False``, i.e. only adjust limits if we own the figure.
     kwargs
         Passed to ``plt.figure`` if ``ax`` is None.
     """
@@ -810,7 +814,8 @@ class Drawing:
         preset=None,
         **kwargs,
     ):
-        """
+        """Draw a zig-zagging line between two coordinates.
+
         Parameters
         ----------
         cooa, coob : tuple[int, int] or tuple[int, int, int]
@@ -940,7 +945,7 @@ class Drawing:
         relative = style.pop("relative", 1.0)
 
         lab = rb[0]
-        scale = lab ** relative
+        scale = lab**relative
         xc = center * lab
         arrow_x = xc - length * scale
         arrow_y = width * scale
@@ -1316,8 +1321,7 @@ class Drawing:
         preset=None,
         **kwargs,
     ):
-        """Draw a cup shape between two points.
-        """
+        """Draw a cup shape between two points."""
         assert which == "left", "Only left cups are supported so far."
 
         style = parse_style_preset(self.presets, preset, **kwargs)
