@@ -24,6 +24,7 @@ from autoray import (
     infer_backend,
     shape,
     size,
+    get_namespace,
 )
 
 try:
@@ -1864,41 +1865,58 @@ class Tensor:
         --------
         TensorNetwork.isel, Tensor.rand_reduce
         """
-        T = self if inplace else self.copy()
+        new = self if inplace else self.copy()
 
         new_inds = []
-        data_loc = []
-        num_project = 0
+        ax_to_sel = {}
+        num_reduced = 0
 
-        for ix in T.inds:
-
+        for ax, ix in enumerate(new.inds):
             if ix not in selectors:
-                sel = slice(None)
+                # index kept as is
+                new_inds.append(ix)
             else:
                 sel = selectors[ix]
-                num_project += 1
 
-            if isinstance(sel, slice):
-                # index will be kept (including a partial slice of entries)
-                new_inds.append(ix)
-                data_loc.append(sel)
-            elif isinstance(sel, str) and sel == "r":
-                # eagerly remove any 'random' selections
-                T.rand_reduce_(ix)
-            else:
-                # index will be removed by selecting a specific index
                 if isinstance(sel, str):
-                    sel = int(sel)
-                data_loc.append(sel)
+                    if sel == "r":
+                        # eagerly remove any 'random' selections
+                        new.rand_reduce_(ix)
+                        num_reduced += 1
+                        continue
+                    else:
+                        # assume single int
+                        sel = int(sel)
 
+                if isinstance(sel, slice):
+                    # index will still be kept (but partial slice of entries)
+                    # XXX: handle iterable as well?
+                    new_inds.append(ix)
 
-        if num_project:
-            T.modify(
-                apply=lambda x: x[tuple(data_loc)],
+                ax_to_sel[ax - num_reduced] = sel
+
+        if len(ax_to_sel) == 1:
+            # single selection, for maximum compatibility
+            # (e.g. with torch.vmap) use `take`
+            ((axis, sel),) = ax_to_sel.items()
+            new.modify(
+                apply=lambda x: do("take", x, sel, axis=axis),
                 inds=new_inds,
                 left_inds=None,
             )
-        return T
+
+        elif ax_to_sel:
+            # multiple axes selections
+            data_loc = tuple(
+                ax_to_sel.get(ax, slice(None)) for ax in range(new.ndim)
+            )
+            new.modify(
+                apply=lambda x: x[data_loc],
+                inds=new_inds,
+                left_inds=None,
+            )
+
+        return new
 
     isel_ = functools.partialmethod(isel, inplace=True)
 
@@ -2245,6 +2263,10 @@ class Tensor:
     def backend(self):
         """The backend inferred from the data."""
         return infer_backend(self._data)
+
+    def get_namespace(self):
+        """Get the namespace of the underlying data array."""
+        return get_namespace(self._data)
 
     def iscomplex(self):
         return iscomplex(self.data)
@@ -11632,7 +11654,9 @@ class TensorNetwork(object):
 
     @property
     def dtype_name(self):
-        """The name of the data type of the array elements."""
+        """The name of the data type of the array elements, asssuming it to be
+        the same for all tensors.
+        """
         return next(iter(self.tensor_map.values())).dtype_name
 
     @property
@@ -11641,6 +11665,12 @@ class TensorNetwork(object):
         the same for all tensors.
         """
         return next(iter(self.tensor_map.values())).backend
+
+    def get_namespace(self):
+        """Get the array namespace of any tensor in this network, asssuming
+        it to be the same for all tensors.
+        """
+        return next(iter(self.tensor_map.values())).get_namespace()
 
     def iscomplex(self):
         return iscomplex(self)
