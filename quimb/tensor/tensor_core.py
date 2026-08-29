@@ -10224,7 +10224,8 @@ class TensorNetwork:
 
         # contract to dense array
         bra = tn.reindex(bra_map)
-        if bra.isfermionic():
+        fermionic = bra.isfermionic()
+        if fermionic:
             # message tensors already carry the required fermionic phases
             phase_inds = bra._outer_inds - message_inds
         else:
@@ -10233,6 +10234,26 @@ class TensorNetwork:
         tnd = bra & tn
         for tm in environment_tensors:
             tnd |= tm
+
+        if fermionic and side == "left":
+            # fermionic phase conventions are only complete for the
+            # right-factor (sqVH) branch of the squared split: the
+            # left-factor (Usq) branch's inner-bond phase correction
+            # structurally never fires, giving parity-sector sign
+            # errors. So build the squared operator in the MIRRORED
+            # orientation (conj copy on axis 0), compute the right
+            # factor, and map back to (open_inds, inner) with a
+            # phase-carrying fermionic transpose.
+            XX = tnd.to_dense(rix, lix, **contract_opts)
+            R = squared_op_to_reduced_factor(
+                XX,
+                d1,
+                d0,
+                right=True,
+                **reduce_opts,
+            )
+            return R.transpose((1, 0))
+
         XX = tnd.to_dense(lix, rix, **contract_opts)
 
         return squared_op_to_reduced_factor(
